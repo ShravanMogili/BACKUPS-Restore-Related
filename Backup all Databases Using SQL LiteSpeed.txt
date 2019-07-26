@@ -1,0 +1,705 @@
+This script backs up all databases or a specified database to a disk location. Databases can be explicitly excluded from backup as well.  Can be used for Full, Differential or Transaction Log Backups.  Can also dynamically create sub directories for each database, as well as perform DBCC and restore verify operations.  Includes LiteSpeed support for multi-threading and encryption.
+
+
+USE msdb
+GO
+IF EXISTS (SELECT 1 FROM sysobjects WHERE [name] = 'prc_DoSLSBackup' AND type = 'P')
+	DROP PROC prc_DoSLSBackup
+GO
+--
+-- prc_DoSLSBackup
+-- Authors: 	Jeffrey Aven, Imceda Software, Inc.
+-- 
+-- Revision History:
+-- 07/02 – 1.0 	(Initial Version)
+-- 11/02 - 1.1 	 Added Differential Backup Functionality
+-- 22/03 - 1.2 	 Added Support for Exclusion of Databases
+-- 24/09 - 1.3   Added Error Handling for Concurrent Backup Operations
+-- 15/10 - 1.4   Fixed Imtermittent Issue with Excluded DBs 
+--		 Continues backing up after DBCC error returns error at the end of the procedure
+-- 16/10 - 1.5   Added support for creating subdirectory for each database
+-- 28/11 - 1.501 Added support for logging
+-- 03/12 - 1.502 Added support for servername directory
+
+
+CREATE PROCEDURE prc_DoSLSBackup
+@BackupType char(1) = 'F' 			
+--'D' for Differential Backups
+--'F' for Full Database Backup (Default)
+--'L' for Transaction Log Backup
+,@DBName sysname = '*'
+--'*' for Backup All Databases (Default)
+--'<database_name>' to backup an individual database 
+,@BackupDir varchar(1024)
+--Directory to store SQL LiteSpeed Backups
+,@DoVerify bit = 1
+--1 = Perform Verification of SQL LIteSpeed Backups (Default)
+--0 = Skip Verification
+,@UseCmdLine bit = 0
+--1 = Use SQL LiteSpeed Command Line Interface
+--0 = Use SQL LiteSpeed Extended Stored Procedure Interface (Default)
+,@Debug int = 0
+--2 = Print verbose logging and generate SQL LiteSpeed log files
+--1 = Print verbose logging
+--0 = Minimal logging (Default)
+,@EncryptionKey varchar(1024) = NULL
+--Encryption Key used to secure SQL LiteSpeed Backup Devices (Optional)
+,@Threads int = NULL
+--Number of Threads to use for SQL LiteSpeed Backup, dynamically determined if not supplied
+,@Priority int = NULL
+--Base priority of SQL LiteSpeed Backup process, dynamically determined if not supplied
+,@RetainDays int = NULL
+--Number of days to retain backup device files, if supplied backup files older than the number of days specified 
+--will be purged
+,@InitBackupDevice bit = 0
+--1 = Reinitialize backup device without date time stamp 
+--0 = Create a new device for each backup which has the date time stamp embedded in the file name (Default)
+,@PerformDBCC bit = 1
+--1 = Perform DBCC CHECKDB prior to backing up database (default) 
+--0 = Do not Perform DBCC CHECKDB prior to backing up database
+,@ExcludedDBs varchar(2048) = NULL
+--Comma Delimited List of Databases in Double Quotes to be Excluded From Backup Operation
+--CAUTION: Ensure proper syntax (eg '"pubs","Northwind"')
+,@create_sub_dir bit = 0
+--Creates a subdirectory under the backup directory for each db being backed up
+,@create_server_dir bit = 0
+--Creates a directory under the backup directory for the current server, used for scenarios where muliple servers 
+--are backing up to the same location, ensures no namespace conflicts
+
+AS
+SET NOCOUNT ON
+--Local Variables
+DECLARE @DBStatus int
+	,@DBMode varchar(50)
+	,@StatusMsgPrefix char(18)
+	,@StatusMsg varchar(1024)
+	,@PhyName varchar(1024)
+	,@BackupType2 varchar(4)
+	,@Cmd varchar(1024)
+	,@RC int
+	,@dbid int
+	,@BackupStartTime varchar(12)
+	,@BackupAllDBs bit
+	,@Operation varchar(6)
+	,@CmdStr varchar(255)
+	,@BUFile varchar(255)
+	,@BUFileDate char(12)
+	,@BUFileDate2 smalldatetime
+	,@BaseBUFileDatalength int
+	,@sqlstr varchar(1048)
+	,@is_db_excluded bit
+	,@orig_backup_dir varchar(512)
+
+SELECT @StatusMsgPrefix =  'prc_DoSLSBackup : ' 
+SELECT @BackupAllDBs = 0
+SELECT @orig_backup_dir = @BackupDir
+
+--Check Access Level
+IF IS_SRVROLEMEMBER ( 'sysadmin') = 0
+	BEGIN
+	SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Insufficient system access for ' + SUSER_SNAME() 
+				+ ' to perform SQLLiteSpeed backup'
+	RAISERROR(@StatusMsg,16,1)
+	RETURN 1 	
+	END
+
+--Validate @BackupType Argument
+IF @BackupType IN ('L', 'F', 'D')
+	BEGIN
+	IF @BackupType = 'L'
+		SELECT @BackupType2 = 'Log'
+	IF @BackupType = 'F'
+		SELECT @BackupType2 = 'Full'
+	IF @BackupType = 'D'
+		SELECT @BackupType2 = 'Diff'
+	END
+ELSE
+	BEGIN
+	SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Valid parameters for @BackupType are L,F,D' 
+	RAISERROR(@StatusMsg,16,1)
+	RETURN 1 	
+	END
+
+--Validate @DBName Argument
+IF @DBName <> '*'
+	BEGIN
+	IF NOT EXISTS (SELECT [name] FROM master.dbo.sysdatabases WHERE [name] = @DBName)
+		BEGIN
+		SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Invalid database selected for @DBName (' + @DBName 
+					+ ') parameter' 
+		RAISERROR(@StatusMsg,16,1)
+		RETURN 1 	
+		END 	
+	IF @Debug > 0
+		BEGIN
+		SELECT @StatusMsg = @StatusMsgPrefix + @DBName + ' Selected for ' + @BackupType2 + ' Backup' 
+		PRINT @StatusMsg
+		END
+	GOTO DoBackup
+	END
+ELSE
+	BEGIN
+	SELECT @BackupAllDBs = 1
+	IF @Debug > 0
+		BEGIN
+		SELECT @StatusMsg = @StatusMsgPrefix + ' All Databases Selected for ' + @BackupType2 + ' Backup' 
+		PRINT @StatusMsg
+		END
+	END
+
+DECLARE DBs CURSOR FOR
+SELECT name, dbid, status
+FROM master..sysdatabases
+WHERE [name] <> 'tempdb'
+FOR READ ONLY
+
+OPEN DBs
+FETCH NEXT FROM DBs INTO @DBName, @dbid, @DBStatus
+WHILE @@FETCH_STATUS = 0
+	BEGIN
+	--Is Databases Explicitly Excluded
+	IF @ExcludedDBs IS NOT NULL
+		BEGIN
+		SELECT @ExcludedDBs = REPLACE(@ExcludedDBs,'"',char(39))
+		IF EXISTS (SELECT 1 FROM tempdb..sysobjects WHERE [name] = 'tmp_is_db_excluded')
+			DROP TABLE tempdb..tmp_is_db_excluded
+		
+		CREATE TABLE tempdb..tmp_is_db_excluded
+			(
+			is_db_excluded bit 
+			)
+		-- J. O'Brien need to reset bit field to 0 as if tmp_is_db_excluded is empty
+		SELECT @is_db_excluded = 0
+		SELECT @sqlstr = 'IF ' + char(39) + @DBName + char(39) + ' IN (' + @ExcludedDBs  + ') INSERT tempdb..tmp_is_db_excluded SELECT 1'
+		EXEC (@sqlstr)
+		SELECT @is_db_excluded = is_db_excluded FROM tempdb..tmp_is_db_excluded
+		IF @is_db_excluded = 1
+			BEGIN
+			IF @Debug > 0
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + ' Skippping ' + @DBName + ' as this database has been explicitly excluded' 
+				PRINT @StatusMsg
+				END
+			GOTO NextDB
+			END
+		END
+DoBackup:	
+	SELECT @Operation = 'Backup'
+	SELECT @BackupStartTime = CONVERT(varchar(12),GETDATE(),12) + REPLACE(CONVERT(varchar(12),GETDATE(),8),':','')
+	IF @BackupType = 'L'
+		BEGIN
+		--Check for System Database
+		IF @dbid <= 4
+			BEGIN
+			IF @Debug > 0
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + 'System Database (' + @DBName 
+							+ ') skipped for transaction log backup' 
+				PRINT @StatusMsg
+				END
+			IF @BackupAllDBs = 1
+				GOTO NextDB
+			ELSE
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Unable to backup ' + @DBName 
+							+ ' - System Database' 
+				RAISERROR(@StatusMsg,16,1)
+				RETURN 1
+				END
+			END 	
+			--Check for Simple Recovery Model		
+			IF @DBStatus & 8 <> 0
+				BEGIN
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Database (' + @DBName 
+							+ ') skipped for transaction log backup - Simple Recovery Model' 
+					PRINT @StatusMsg
+					END
+				IF @BackupAllDBs = 1
+					GOTO NextDB
+				ELSE
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Unable to backup ' 
+								+ @DBName + ' - Simple Recovery Model' 
+					RAISERROR(@StatusMsg,16,1)
+					RETURN 1
+					END 
+				END	
+			END
+
+ 		--Check Database Accessibility
+		SELECT @DBMode = 'OK'
+		IF DATABASEPROPERTY(@DBName, 'IsDetached') > 0 
+				SELECT @DBMode = 'Detached'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsInLoad') > 0 
+				SELECT @DBMode = 'Loading'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsNotRecovered') > 0 
+				SELECT @DBMode = 'Not Recovered'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsInRecovery') > 0 
+				SELECT @DBMode = 'Recovering'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsSuspect') > 0 
+				SELECT @DBMode = 'Suspect'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsOffline') > 0  	
+				SELECT @DBMode = 'Offline'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsEmergencyMode') > 0 
+				SELECT @DBMode = 'Emergency Mode'
+			ELSE IF DATABASEPROPERTY(@DBName, 'IsShutDown') > 0 
+				SELECT @DBMode = 'Shut Down (problems during startup)'
+		IF @DBMode <> 'OK'
+			BEGIN			
+			IF @Debug > 0
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + 'Unable to backup ' + @DBName 
+							+ ' - Database is in '  + @DBMode + ' state'
+				PRINT @StatusMsg
+				END
+			IF @BackupAllDBs = 1
+				GOTO NextDB
+			ELSE
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Unable to backup ' + @DBName 
+							+ ' - Database is in '  + @DBMode + ' state'
+				RAISERROR(@StatusMsg,16,1)
+				RETURN 1
+				END
+			END			
+		--Check if Backup Directory Exists
+		IF @create_server_dir = 1 and @create_sub_dir = 1
+			SELECT @BackupDir = @orig_backup_dir + '\' + @@SERVERNAME + '\' + @DBName
+		IF @create_server_dir = 1 and @create_sub_dir = 0
+			SELECT @BackupDir = @orig_backup_dir + '\' + @@SERVERNAME
+		IF @create_server_dir = 0 and @create_sub_dir = 1
+			SELECT @BackupDir = @orig_backup_dir + '\' + @DBName
+		
+		SELECT @Cmd = 'dir "' + @BackupDir + '"' 
+		EXEC @RC = master..xp_cmdshell @Cmd, NO_OUTPUT
+		IF @RC <> 0
+			--Create Backup Directory
+			BEGIN
+			SELECT @Cmd = 'md "' + @BackupDir + '"'
+			EXEC @RC = master.dbo.xp_cmdshell @Cmd, NO_OUTPUT
+			IF @RC <> 0
+				BEGIN		 
+				SELECT @StatusMsg = @StatusMsgPrefix + ' Error - Unable to create backup directory (' 
+							+ @BackupDir + ')'
+				RAISERROR(@StatusMsg,16,1)
+				RETURN 1
+				END
+			END
+
+		--Build the Backup File Name
+		SELECT @PhyName = @BackupDir + '\' + REPLACE(@@SERVERNAME,'\','_')  + '.' + REPLACE(@DBName,'.','_') 
+				+ '.'	+ @BackupType2 
+		IF @InitBackupDevice = 0
+			--New Device For Each Backup
+			SELECT @PhyName = @PhyName + @BackupStartTime + '.SLS' 
+		ELSE
+			--Re-Initialize Each Backup Device
+			SELECT @PhyName = @PhyName + '.SLS' 
+
+		--Set Tuning Defaults
+		IF @Threads IS NULL
+			BEGIN
+			CREATE TABLE #MSVer
+			(
+			[Index] int
+			,[Name] varchar (255)
+			,Internal_Value int NULL
+			,Charater_Value varchar(255)
+			)
+			INSERT #MSVer EXEC master..xp_msver
+			SELECT @Threads = Internal_Value FROM #MSVer WHERE [Name] = 'ProcessorCount'	
+			DROP TABLE #MSVer
+			END
+		IF @Priority IS NULL
+			SELECT @Priority = 0	
+		--Do DBCC CHECKDB
+		IF @PerformDBCC = 1
+			BEGIN
+			IF @Debug > 0
+				BEGIN
+				SELECT @StatusMsg = @StatusMsgPrefix + 'Executing DBCC CHECKDB on Database ' + @DBName 
+							+ char(10)
+				PRINT @StatusMsg
+				DBCC CHECKDB (@DBName)
+				END
+			ELSE
+				DBCC CHECKDB (@DBName) WITH NO_INFOMSGS
+			SET @RC = @@ERROR
+			IF @RC <> 0
+				BEGIN
+				SELECT @Operation = 'DBCC CHECKDB'
+				GOTO FailedBackup
+				END	
+			END
+		
+		--Do Backup
+		IF @BackupType = 'F'
+			--Perform Full Database Backup
+			BEGIN
+			IF @UseCmdLine = 1
+				BEGIN
+				SELECT @Cmd = char(34) + 'C:\Program Files\DBAssociates\SQLLiteSpeed\SQLLiteSpeed.EXE' + char(34) 
+						+ ' -S' + @@SERVERNAME
+						+ ' -BDatabase'
+						+ ' -D' + @DBName
+						+ ' -F' + @PhyName
+						+ ' -t' + CONVERT(varchar(2),@Threads)
+						+ ' -p' + CONVERT(varchar(2),@Priority)
+						+ ' -I'
+						+ ' -T'  
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + ' -K' + @EncryptionKey
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' + @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					EXEC @RC = master..xp_cmdshell @Cmd
+					END
+				ELSE
+					EXEC @RC = master..xp_cmdshell @Cmd, NO_OUTPUT
+				END
+			ELSE
+				BEGIN
+				SELECT @Cmd = 'EXEC master..xp_backup_database' + char(10)
+						+ char(9) + '@database = ' + char(39) + @DBName + char(39) + char(10)
+						+ char(9) + ', @filename = ' + char(39) + @PhyName + char(39) + char(10)
+						+ char(9) + ', @threads = ' + CONVERT(varchar(2),@Threads) + char(10)
+						+ char(9) + ', @priority = ' + CONVERT(varchar(2),@Priority) + char(10)
+						+ char(9) + ', @init = 1' + char(10)
+						+ char(9) + ', @logging = ' + CONVERT(char(1),@Debug) + char(10)
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + char(9) + ', @encryptionkey = ' + char(39) 
+							+ @EncryptionKey + char(39) + char(10)
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' 
+								+ @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					END
+				IF @EncryptionKey IS NOT NULL
+					EXEC @RC = master..xp_backup_database
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@encryptionkey = @EncryptionKey
+							,@logging = @Debug
+				ELSE
+					EXEC @RC = master..xp_backup_database
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@logging = @Debug
+				END
+			IF @RC <> 0
+				GOTO FailedBackup
+			END
+
+		IF @BackupType = 'D'
+			--Perform Differential Database Backup
+			BEGIN
+			IF @DBName = 'master'
+				GOTO NextDB
+			IF @UseCmdLine = 1
+				BEGIN
+				SELECT @Cmd = char(34) + 'C:\Program Files\DBAssociates\SQLLiteSpeed\SQLLiteSpeed.EXE' + char(34) 
+						+ ' -S' + @@SERVERNAME
+						+ ' -BDatabase'
+						+ ' -D' + @DBName
+						+ ' -F' + @PhyName
+						+ ' -t' + CONVERT(varchar(2),@Threads)
+						+ ' -p' + CONVERT(varchar(2),@Priority)
+						+ ' -I'
+						+ ' -T'  		
+						+ ' -WDIFFERENTIAL'
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + ' -K' + @EncryptionKey
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' + @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					EXEC @RC = master..xp_cmdshell @Cmd
+					END
+				ELSE
+					EXEC @RC = master..xp_cmdshell @Cmd, NO_OUTPUT
+				END
+			ELSE
+				BEGIN
+				SELECT @Cmd = 'EXEC master..xp_backup_database' + char(10)
+						+ char(9) + '@database = ' + char(39) + @DBName + char(39) + char(10)
+						+ char(9) + ', @filename = ' + char(39) + @PhyName + char(39) + char(10)
+						+ char(9) + ', @threads = ' + CONVERT(varchar(2),@Threads) + char(10)
+							+ char(9) + ', @priority = ' + CONVERT(varchar(2),@Priority) + char(10)
+						+ char(9) + ', @init = 1' + char(10)
+						+ char(9) + ', @with = ' + char(39) + 'DIFFERENTIAL' + char(39) + char(10)
+						+ char(9) + ', @logging = ' + CONVERT(char(1),@Debug) + char(10)
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + char(9) + ', @encryptionkey = ' + char(39) 
+							+ @EncryptionKey + char(39) + char(10)
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' + @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					END
+				IF @EncryptionKey IS NOT NULL
+					EXEC @RC = master..xp_backup_database
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@encryptionkey = @EncryptionKey
+							,@with = 'DIFFERENTIAL'
+							,@logging = @Debug
+				ELSE
+					EXEC @RC = master..xp_backup_database
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@with = 'DIFFERENTIAL'
+							,@logging = @Debug
+				END
+			IF @RC <> 0
+				BEGIN
+				IF @RC = 11704
+					BEGIN
+					GOTO NextDB
+					END
+				ELSE
+					BEGIN
+					GOTO FailedBackup
+					END
+				END
+			END
+			
+		IF @BackupType = 'L'
+			--Perform Transaction Log Backup
+			BEGIN
+			IF @UseCmdLine = 1
+				BEGIN
+				SELECT @Cmd = char(34) + 'C:\Program Files\DBAssociates\SQLLiteSpeed\SQLLiteSpeed.EXE' + char(34) 
+						+ ' -S' + @@SERVERNAME
+						+ ' -BLog'
+						+ ' -D' + @DBName
+						+ ' -F' + @PhyName
+						+ ' -t' + CONVERT(varchar(2),@Threads)
+						+ ' -p' + CONVERT(varchar(2),@Priority)
+						+ ' -I'
+						+ ' -T'  		
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + ' -K' + @EncryptionKey
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' + @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					EXEC @RC = master..xp_cmdshell @Cmd
+					END
+				ELSE
+					EXEC @RC = master..xp_cmdshell @Cmd, NO_OUTPUT
+				END
+			ELSE
+				BEGIN
+				SELECT @Cmd = 'EXEC master..xp_backup_log' + char(10)
+						+ char(9) + '@database = ' + char(39) + @DBName + char(39) + char(10)
+						+ char(9) + ', @filename = ' + char(39) + @PhyName + char(39) + char(10)
+						+ char(9) + ', @threads = ' + CONVERT(varchar(2),@Threads) + char(10)
+						+ char(9) + ', @priority = ' + CONVERT(varchar(2),@Priority) + char(10)
+						+ char(9) + ', @init = 1' + char(10)
+						+ char(9) + ', @logging = ' + CONVERT(char(1),@Debug) + char(10)
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + char(9) + ', @encryptionkey = ' + char(39) 
+							+ @EncryptionKey + char(39) + char(10)
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Backup of Database ' + @DBName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					END
+				IF @EncryptionKey IS NOT NULL
+					EXEC @RC = master..xp_backup_log
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@encryptionkey = @EncryptionKey
+							,@logging = @Debug
+				ELSE
+					EXEC @RC = master..xp_backup_log
+							@database = @DBName
+							,@filename = @PhyName 
+							,@threads = @Threads
+							,@priority = @Priority
+							,@init = 1
+							,@logging = @Debug
+				END
+			IF @RC <> 0
+				BEGIN
+				IF @RC = 11704
+					BEGIN
+					GOTO NextDB
+					END
+				ELSE
+					BEGIN
+					GOTO FailedBackup
+					END
+				END
+			END
+		--Verify Backup Device
+		IF @DoVerify = 1
+			BEGIN
+			IF @UseCmdLine = 1
+				BEGIN
+				SELECT @Cmd = char(34) + 'C:\Program Files\DBAssociates\SQLLiteSpeed\SQLLiteSpeed.EXE' + char(34) 
+						+ ' -S' + @@SERVERNAME
+						+ ' -RVerifyonly'
+						+ ' -F' + @PhyName
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + ' -K' + @EncryptionKey
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Verifyonly of Backup Device ' 
+								+ @PhyName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					EXEC @RC = master..xp_cmdshell @Cmd	
+					END
+				ELSE
+					EXEC @RC = master..xp_cmdshell @Cmd, NO_OUTPUT						
+				END
+			ELSE
+				BEGIN
+				SELECT @Cmd = 'EXEC master..xp_restore_verifyonly' + char(10)
+						+ char(9) + ' @filename = ' + char(39) + @PhyName + char(39) + char(10)
+				IF @EncryptionKey IS NOT NULL
+					SELECT @Cmd = @Cmd + char(9) + ', @encryptionkey = ' + char(39) 
+							+ @EncryptionKey + char(39) + char(10)
+				IF @Debug > 0
+					BEGIN
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Executing Verifyonly of Backup Device ' 
+								+ @PhyName
+					PRINT @StatusMsg
+					SELECT @StatusMsg = @StatusMsgPrefix + 'Command to be Executed : ' + char(10) 
+								+ char(9) + @Cmd + char(10)
+					PRINT @StatusMsg
+					END
+				IF @EncryptionKey IS NOT NULL
+					EXEC @RC = master..xp_restore_verifyonly
+							@filename = @PhyName 
+							,@encryptionkey = @EncryptionKey
+							,@logging = @Debug
+				ELSE
+					EXEC @RC = master..xp_restore_verifyonly
+							@filename = @PhyName 
+							,@logging = @Debug
+				END
+			IF @RC <> 0
+				BEGIN
+				SELECT @Operation = 'Verify'
+				GOTO FailedBackup
+				END	
+			END
+
+		--Delete Old Backup Files
+		IF @RetainDays IS NOT NULL AND @InitBackupDevice = 0
+			BEGIN
+			--Building up Table of Files to Delete
+			CREATE TABLE #DirOut
+			(
+			[Output] varchar(255)
+			)
+			SELECT @CmdStr = 'dir "' + @BackupDir + '\' + REPLACE(@@SERVERNAME,'\','_')  + '.' 
+						+ REPLACE(@DBName,'.','_') +  '.' + @BackupType2  + '*.SLS" /B'
+			SELECT @BaseBUFileDatalength = LEN(REPLACE(@@SERVERNAME,'\','_')  + '.' 
+						+ REPLACE(@DBName,'.','_') +  '.' + @BackupType2)
+			INSERT #DirOut EXEC master..xp_cmdshell @CmdStr
+			--Scroll Through Table
+			DECLARE BUFiles CURSOR FOR
+			SELECT [Output] FROM #DirOut WHERE [Output] IS NOT NULL
+			FOR READ ONLY
+			OPEN BUFiles
+			FETCH NEXT FROM BUFiles INTO @BUFile
+			WHILE @@FETCH_STATUS = 0
+				BEGIN
+				--Reconstruct DateTime From Filename
+				SELECT @BUFileDate = LEFT(REPLACE(SUBSTRING(@BUFile,@BaseBUFileDatalength + 1,LEN(@BUFile)),'.SLS',''),6)
+				SELECT @BUFileDate2 = CONVERT(smalldatetime,@BUFileDate,12)
+				--Compare Date
+				IF @BUFile <> (REPLACE(@@SERVERNAME,'\','_')  + '.' + REPLACE(@DBName,'.','_') + '.'
+						+ @BackupType2 + '.SLS')
+					BEGIN
+					IF DATEDIFF(d,@BUFileDate2,getdate()) > @RetainDays
+						BEGIN
+						SELECT @CmdStr = 'del "' + @BackupDir + '\' + @BUFile + '"'
+						IF @Debug > 0
+							BEGIN
+							SELECT @StatusMsg = @StatusMsgPrefix + 'Deleting File : ' 
+										+ @BUFile
+							PRINT @StatusMsg										
+							SELECT @StatusMsg = @StatusMsgPrefix 
+										+ 'Command to be Executed : ' + @CmdStr
+							PRINT @StatusMsg							
+							EXEC @RC = master..xp_cmdshell @CmdStr 
+							END
+						ELSE
+							EXEC @RC = master..xp_cmdshell @CmdStr, NO_OUTPUT
+						END
+					END
+					FETCH NEXT FROM BUFiles INTO @BUFile
+					END
+				CLOSE BUFiles
+				DEALLOCATE BUFiles
+				DROP TABLE #DirOut
+			END
+
+		IF @BackupAllDBs = 0
+			GOTO NoCursor
+		ELSE
+			GOTO NextDB
+		
+FailedBackup:
+		SELECT @StatusMsg = @StatusMsgPrefix + ' Error - ' + @Operation + ' Operation Failed for ' 
+					+ @BackupType + ' Backup of ' + @DBName
+		RAISERROR(@StatusMsg,16,1)				
+		IF @BackupAllDBs = 0
+			GOTO NoCursor
+		ELSE
+			GOTO NextDB
+NextDB:
+		FETCH NEXT FROM DBs INTO @DBName, @dbid, @DBStatus
+	END
+
+CLOSE DBs
+DEALLOCATE DBs
+
+NoCursor:
+
+
+
+

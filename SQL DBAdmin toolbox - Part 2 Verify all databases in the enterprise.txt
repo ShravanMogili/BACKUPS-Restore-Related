@@ -1,0 +1,1693 @@
+SQL DBAdmin toolbox - Part 2 Verify all databases in the enterprise
+
+
+
+It is a DBA responsibility to verify that database backups can be successfully restored but many DBAs (the majority ?) fail to do that. It is understandable that in a enterprise environment with hundreds of databases, manually restoring every one every day or week is impossible. But from now on - the moment that you get this set of scripts, there is no excuse any more for not regularly restoring and dbcc checking your database backup files. You can of course just ignore it at your own risk.
+
+It is easy to set up and configure the verification station. For this you need a dedicated SQL server with highest SQL version in the enterprise. This version of script are for SQL Server 2008R2. The server should have enough disk space to restore the largest database. The service account of the database engine must have read access to all the backup files. I hope you have all the backups in a central network share, not in every SQL servers.
+
+Objects used:
+admsp_VerifyBackups: main procedure for restore and verification
+RestoreConfig: configuration table
+_admsp_RestoreDatabase: restore procedure
+_admsp_LogVerificationResult: logging procedure, writing to BackupVerificationResult
+_admsp_InventoryBackupFiles: logging procedure, writing to BackupFiles
+BackupVerificationResult: table for job result
+BackupFiles: table containing information of all backup files
+RestoreFileLisOnlytOutput: User defined table type
+RestoreHeaderOnlyOutput: User defined table type
+BackupInfo: User defined table type
+
+( The DBAdmin name convention: all the stored procedures, except one which is "Help", are prefixed with admsp_ or _admsp_. SPs prefixed with _admsp_ are internal and should be called only by other SPs. )
+
+ 
+
+Deployment and configuration:
+
+1. Create DBAdmin database if it does not exist
+2. Run the script
+3. Configure default restore setting (default setting has level 0: lvl=0)
+
+Sample:
+INSERT INTO [RestoreConfig] ([Dist_Datafile_Dir], [Dist_LogFile_Dir], [Dist_FullText_Dir],[Enable],[lvl])
+VALUES ('D:\SQLData', 'L:\SQLLog', 'D:\SQLData', 1, 0)
+
+4. Configure each database instance (instance setting has level 1: lvl=1)
+
+Sample:
+INSERT INTO [RestoreConfig] ([InstanceName], [SourceRoot], [Enable], [lvl])
+VALUES ('SQLServer1', \\filesahre\sqlbackup$\SQLServer1', 1, 1)
+
+The solution restore all databases under SourceRoot or one level below it.
+
+5. Schedule the agent job executing admsp_VerifyBackups.
+
+ 
+
+The results of job is logged in two tables: BackupVerificationResult and BackupFiles. Right now yo have to check the tables manually to find anything wrong with the backups. The analysis and alert part will be added later. However it will not be the next one. In the next part we will look at backup.
+
+I do not provide much documentation here, if you need any help please write in the forum for this, I will be glad to help.
+
+ 
+
+Next: Part 3 Adaptive backup
+
+/****** Object: UserDefinedTableType [dbo].[RestoreHeaderOnlyOutput] Script Date: 06/15/2011 12:21:40 ******/
+
+CREATE TYPE [dbo].[RestoreHeaderOnlyOutput] AS TABLE(
+
+????[BackupName] [nvarchar](128) NULL,
+
+????[BackupDescription] [nvarchar](255) NULL,
+
+????[BackupType] [smallint] NULL,
+
+????[ExpirationDate] [datetime] NULL,
+
+????[Compressed] [tinyint] NULL,
+
+????[Position] [smallint] NULL,
+
+????[DeviceType] [tinyint] NULL,
+
+????[UserName] [nvarchar](128) NULL,
+
+????[ServerName] [nvarchar](128) NULL,
+
+????[DatabaseName] [nvarchar](128) NULL,
+
+????[DatabaseVersion] [int] NULL,
+
+????[DatabaseCreationDate] [datetime] NULL,
+
+????[BackupSize] [numeric](20, 0) NULL,
+
+????[FirstLSN] [numeric](25, 0) NULL,
+
+????[LastLSN] [numeric](25, 0) NULL,
+
+????[CheckpointLSN] [numeric](25, 0) NULL,
+
+????[DatabaseBackupLSN] [numeric](25, 0) NULL,
+
+????[BackupStartDate] [datetime] NULL,
+
+????[BackupFinishDate] [datetime] NULL,
+
+????[SortOrder] [smallint] NULL,
+
+????[CodePage] [smallint] NULL,
+
+????[UnicodeLocaleId] [int] NULL,
+
+????[UnicodeComparisonStyle] [int] NULL,
+
+????[CompatibilityLevel] [tinyint] NULL,
+
+????[SoftwareVendorId] [int] NULL,
+
+????[SoftwareVersionMajor] [int] NULL,
+
+????[SoftwareVersionMinor] [int] NULL,
+
+????[SoftwareVersionBuild] [int] NULL,
+
+????[MachineName] [nvarchar](128) NULL,
+
+????[Flags] [int] NULL,
+
+????[BindingID] [uniqueidentifier] NULL,
+
+????[RecoveryForkID] [uniqueidentifier] NULL,
+
+????[Collation] [nvarchar](128) NULL,
+
+????[FamilyGUID] [uniqueidentifier] NULL,
+
+????[HasBulkLoggedData] [bit] NULL,
+
+????[IsSnapshot] [bit] NULL,
+
+????[IsReadOnly] [bit] NULL,
+
+????[IsSingleUser] [bit] NULL,
+
+????[HasBackupChecksums] [bit] NULL,
+
+????[IsDamaged] [bit] NULL,
+
+????[BeginsLogChain] [bit] NULL,
+
+????[HasIncompleteMetaData] [bit] NULL,
+
+????[IsForceOffline] [bit] NULL,
+
+????[IsCopyOnly] [bit] NULL,
+
+????[FirstRecoveryForkID] [uniqueidentifier] NULL,
+
+????[ForkPointLSN] [numeric](25, 0) NULL,
+
+????[RecoveryModel] [nvarchar](60) NULL,
+
+????[DifferentialBaseLSN] [numeric](25, 0) NULL,
+
+????[DifferentialBaseGUID] [uniqueidentifier] NULL,
+
+????[BackupTypeDescription] [nvarchar](60) NULL,
+
+????[BackupSetGUID] [uniqueidentifier] NULL,
+
+????[CompressedBackupSize] [numeric](20, 0) NULL
+
+)
+
+GO
+
+
+
+/****** Object: UserDefinedTableType [dbo].[RestoreFileLisOnlytOutput] Script Date: 06/15/2011 12:21:40 ******/
+
+CREATE TYPE [dbo].[RestoreFileLisOnlytOutput] AS TABLE(
+
+????[lName] [nvarchar](128) NULL,
+
+????[phName] [nvarchar](260) NULL,
+
+????[Type] [char](1) NULL,
+
+????[fGrpName] [nvarchar](128) NULL,
+
+????[Size] [numeric](25, 0) NULL,
+
+????[MaxSize] [numeric](25, 0) NULL,
+
+????[fileId] [bigint] NULL,
+
+????[CreateLSN] [numeric](25, 0) NULL,
+
+????[DropLSN] [numeric](25, 0) NULL,
+
+????[UniqueId] [uniqueidentifier] NULL,
+
+????[ReadOnlyLSN] [numeric](25, 0) NULL,
+
+????[ReadWriteLSN] [numeric](25, 0) NULL,
+
+????[BackupSizeInBytes] [bigint] NULL,
+
+????[SourceBlockSize] [int] NULL,
+
+????[FileGroupId] [int] NULL,
+
+????[LogGroupGuid] [uniqueidentifier] NULL,
+
+????[DiffBaseLSN] [numeric](25, 0) NULL,
+
+????[DiffBaseGuid] [uniqueidentifier] NULL,
+
+????[IsReadOnly] [bit] NULL,
+
+????[IsPresent] [bit] NULL,
+
+????[TDEThumbprint] [decimal](18, 0) NULL
+
+)
+
+GO
+
+
+
+/****** Object: Table [dbo].[RestoreConfig] Script Date: 06/15/2011 12:21:34 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+SET ANSI_PADDING ON
+
+GO
+
+CREATE TABLE [dbo].[RestoreConfig](
+
+????[ConfigGuid] [uniqueidentifier] NOT NULL,
+
+????[InstanceName] [varchar](50) NULL,
+
+????[SourceRoot] [varchar](255) NULL,
+
+????[DatabaseName] [varchar](50) NULL,
+
+????[Dist_Datafile_Dir] [varchar](255) NULL,
+
+????[Dist_LogFile_Dir] [varchar](255) NULL,
+
+????[Dist_FullText_Dir] [varchar](255) NULL,
+
+????[DBExclude] [varchar](2000) NULL,
+
+????[Enable] [bit] NOT NULL,
+
+????[lvl] [tinyint] NOT NULL,
+
+CONSTRAINT [PK_RestoreConfig] PRIMARY KEY CLUSTERED 
+
+(
+
+????[ConfigGuid] ASC
+
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY],
+
+CONSTRAINT [UIX_RestoreConfig] UNIQUE NONCLUSTERED 
+
+(
+
+????[InstanceName] ASC
+
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+
+) ON [PRIMARY]
+
+GO
+
+SET ANSI_PADDING OFF
+
+GO
+
+ALTER TABLE [dbo].[RestoreConfig] ADD CONSTRAINT [DF_RestoreConfig_ConfigGuid] DEFAULT (newid()) FOR [ConfigGuid]
+
+GO
+
+ALTER TABLE [dbo].[RestoreConfig] ADD CONSTRAINT [DF_RestoreConfig_DatabaseName] DEFAULT ('') FOR [DatabaseName]
+
+GO
+
+ALTER TABLE [dbo].[RestoreConfig] ADD CONSTRAINT [DF_RestoreConfig_Active] DEFAULT ((1)) FOR [Enable]
+
+GO
+
+ALTER TABLE [dbo].[RestoreConfig] ADD CONSTRAINT [DF_RestoreConfig_Level] DEFAULT ((1)) FOR [lvl]
+
+GO
+
+
+
+/****** Object: Table [dbo].[BackupVerificationResult] Script Date: 06/15/2011 12:21:34 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+SET ANSI_PADDING ON
+
+GO
+
+CREATE TABLE [dbo].[BackupVerificationResult](
+
+????[RowId] [bigint] IDENTITY(1,1) NOT NULL,
+
+????[BatchStartTime] [datetime] NOT NULL,
+
+????[InstanceName] [varchar](128) NULL,
+
+????[FolderName] [varchar](128) NULL,
+
+????[DatabaseName] [varchar](128) NULL,
+
+????[Description] [varchar](500) NOT NULL,
+
+????[Result] [int] NOT NULL,
+
+????[Info] [varchar](200) NULL,
+
+????[Message] [varchar](max) NULL,
+
+????[LogDateTime] [datetime] NOT NULL,
+
+CONSTRAINT [PK_VerifyResult] PRIMARY KEY CLUSTERED 
+
+(
+
+????[RowId] ASC
+
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+
+) ON [PRIMARY]
+
+GO
+
+SET ANSI_PADDING OFF
+
+GO
+
+
+
+/****** Object: UserDefinedTableType [dbo].[BackupInfo] Script Date: 06/15/2011 12:21:39 ******/
+
+CREATE TYPE [dbo].[BackupInfo] AS TABLE(
+
+????[Folder] [varchar](128) NULL,
+
+????[DiskFileName] [varchar](500) NULL,
+
+????[BackupName] [nvarchar](128) NULL,
+
+????[BackupDescription] [nvarchar](255) NULL,
+
+????[BackupType] [smallint] NULL,
+
+????[ExpirationDate] [datetime] NULL,
+
+????[Compressed] [tinyint] NULL,
+
+????[Position] [smallint] NULL,
+
+????[DeviceType] [tinyint] NULL,
+
+????[UserName] [nvarchar](128) NULL,
+
+????[ServerName] [nvarchar](128) NULL,
+
+????[DatabaseName] [nvarchar](128) NULL,
+
+????[DatabaseVersion] [int] NULL,
+
+????[DatabaseCreationDate] [datetime] NULL,
+
+????[BackupSize] [numeric](20, 0) NULL,
+
+????[FirstLSN] [numeric](25, 0) NULL,
+
+????[LastLSN] [numeric](25, 0) NULL,
+
+????[CheckpointLSN] [numeric](25, 0) NULL,
+
+????[DatabaseBackupLSN] [numeric](25, 0) NULL,
+
+????[BackupStartDate] [datetime] NULL,
+
+????[BackupFinishDate] [datetime] NULL,
+
+????[SortOrder] [smallint] NULL,
+
+????[CodePage] [smallint] NULL,
+
+????[UnicodeLocaleId] [int] NULL,
+
+????[UnicodeComparisonStyle] [int] NULL,
+
+????[CompatibilityLevel] [tinyint] NULL,
+
+????[SoftwareVendorId] [int] NULL,
+
+????[SoftwareVersionMajor] [int] NULL,
+
+????[SoftwareVersionMinor] [int] NULL,
+
+????[SoftwareVersionBuild] [int] NULL,
+
+????[MachineName] [nvarchar](128) NULL,
+
+????[Flags] [int] NULL,
+
+????[BindingID] [uniqueidentifier] NULL,
+
+????[RecoveryForkID] [uniqueidentifier] NULL,
+
+????[Collation] [nvarchar](128) NULL,
+
+????[FamilyGUID] [uniqueidentifier] NULL,
+
+????[HasBulkLoggedData] [bit] NULL,
+
+????[IsSnapshot] [bit] NULL,
+
+????[IsReadOnly] [bit] NULL,
+
+????[IsSingleUser] [bit] NULL,
+
+????[HasBackupChecksums] [bit] NULL,
+
+????[IsDamaged] [bit] NULL,
+
+????[BeginsLogChain] [bit] NULL,
+
+????[HasIncompleteMetaData] [bit] NULL,
+
+????[IsForceOffline] [bit] NULL,
+
+????[IsCopyOnly] [bit] NULL,
+
+????[FirstRecoveryForkID] [uniqueidentifier] NULL,
+
+????[ForkPointLSN] [numeric](25, 0) NULL,
+
+????[RecoveryModel] [nvarchar](60) NULL,
+
+????[DifferentialBaseLSN] [numeric](25, 0) NULL,
+
+????[DifferentialBaseGUID] [uniqueidentifier] NULL,
+
+????[BackupTypeDescription] [nvarchar](60) NULL,
+
+????[BackupSetGUID] [uniqueidentifier] NULL,
+
+????[CompressedBackupSize] [numeric](20, 0) NULL
+
+)
+
+GO
+
+
+
+/****** Object: Table [dbo].[BackupFiles] Script Date: 06/15/2011 12:21:34 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+SET ANSI_PADDING ON
+
+GO
+
+CREATE TABLE [dbo].[BackupFiles](
+
+????[RowId] [bigint] IDENTITY(1,1) NOT NULL,
+
+????[DiskFileName] [varchar](500) NOT NULL,
+
+????[BackupName] [nvarchar](128) NULL,
+
+????[BackupDescription] [nvarchar](255) NULL,
+
+????[BackupType] [smallint] NULL,
+
+????[ExpirationDate] [datetime] NULL,
+
+????[Compressed] [tinyint] NULL,
+
+????[Position] [smallint] NULL,
+
+????[DeviceType] [tinyint] NULL,
+
+????[UserName] [nvarchar](128) NULL,
+
+????[ServerName] [nvarchar](128) NULL,
+
+????[DatabaseName] [nvarchar](128) NULL,
+
+????[DatabaseVersion] [int] NULL,
+
+????[DatabaseCreationDate] [datetime] NULL,
+
+????[BackupSize] [numeric](20, 0) NULL,
+
+????[FirstLSN] [numeric](25, 0) NULL,
+
+????[LastLSN] [numeric](25, 0) NULL,
+
+????[CheckpointLSN] [numeric](25, 0) NULL,
+
+????[DatabaseBackupLSN] [numeric](25, 0) NULL,
+
+????[BackupStartDate] [datetime] NULL,
+
+????[BackupFinishDate] [datetime] NULL,
+
+????[SortOrder] [smallint] NULL,
+
+????[CodePage] [smallint] NULL,
+
+????[UnicodeLocaleId] [int] NULL,
+
+????[UnicodeComparisonStyle] [int] NULL,
+
+????[CompatibilityLevel] [tinyint] NULL,
+
+????[SoftwareVendorId] [int] NULL,
+
+????[SoftwareVersionMajor] [int] NULL,
+
+????[SoftwareVersionMinor] [int] NULL,
+
+????[SoftwareVersionBuild] [int] NULL,
+
+????[MachineName] [nvarchar](128) NULL,
+
+????[Flags] [int] NULL,
+
+????[BindingID] [uniqueidentifier] NULL,
+
+????[RecoveryForkID] [uniqueidentifier] NULL,
+
+????[Collation] [nvarchar](128) NULL,
+
+????[FamilyGUID] [uniqueidentifier] NULL,
+
+????[HasBulkLoggedData] [bit] NULL,
+
+????[IsSnapshot] [bit] NULL,
+
+????[IsReadOnly] [bit] NULL,
+
+????[IsSingleUser] [bit] NULL,
+
+????[HasBackupChecksums] [bit] NULL,
+
+????[IsDamaged] [bit] NULL,
+
+????[BeginsLogChain] [bit] NULL,
+
+????[HasIncompleteMetaData] [bit] NULL,
+
+????[IsForceOffline] [bit] NULL,
+
+????[IsCopyOnly] [bit] NULL,
+
+????[FirstRecoveryForkID] [uniqueidentifier] NULL,
+
+????[ForkPointLSN] [numeric](25, 0) NULL,
+
+????[RecoveryModel] [nvarchar](60) NULL,
+
+????[DifferentialBaseLSN] [numeric](25, 0) NULL,
+
+????[DifferentialBaseGUID] [uniqueidentifier] NULL,
+
+????[BackupTypeDescription] [nvarchar](60) NULL,
+
+????[BackupSetGUID] [uniqueidentifier] NULL,
+
+????[CompressedBackupSize] [numeric](20, 0) NULL,
+
+????[FirstCheckTime] [datetime] NOT NULL,
+
+????[LastCheckTime] [datetime] NOT NULL,
+
+????[IsDeleted] [bit] NOT NULL,
+
+????[LastBatchStartTime] [datetime] NULL,
+
+CONSTRAINT [PK_BackupFiles] PRIMARY KEY CLUSTERED 
+
+(
+
+????[RowId] ASC
+
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+
+) ON [PRIMARY]
+
+GO
+
+SET ANSI_PADDING OFF
+
+GO
+
+ALTER TABLE [dbo].[BackupFiles] ADD CONSTRAINT [DF_BackupFiles_FirstCheckTime] DEFAULT (getdate()) FOR [FirstCheckTime]
+
+GO
+
+ALTER TABLE [dbo].[BackupFiles] ADD CONSTRAINT [DF_BackupFiles_LastCheckTime] DEFAULT (getdate()) FOR [LastCheckTime]
+
+GO
+
+ALTER TABLE [dbo].[BackupFiles] ADD CONSTRAINT [DF_BackupFiles_IsDeleted] DEFAULT ((0)) FOR [IsDeleted]
+
+GO
+
+CREATE NONCLUSTERED INDEX [IX_BackupFiles_FileName] ON [dbo].[BackupFiles] 
+
+(
+
+????[DiskFileName] ASC
+
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+
+GO
+
+
+
+
+
+/****** Object: StoredProcedure [dbo].[_admsp_RestoreDatabase] Script Date: 06/15/2011 12:21:38 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+/********************************************************************************
+
+* Restore a database from a list of files contained in @backupinfo parameter 
+
+*
+
+* Internal procedure, called by dbo.admsp_VerifyBackups only
+
+*********************************************************************************/
+
+CREATE PROC [dbo].[_admsp_RestoreDatabase] 
+
+????@backupinfo dbo.backupinfo READONLY,
+
+????@datafile_dir VARCHAR(500),
+
+????@logfile_dir VARCHAR(500),
+
+????@fulltext_root VARCHAR(500),
+
+????@NewDBName VARCHAR(128) OUT,
+
+????@FullbackupTime DateTime OUT,
+
+????@LastLogBackupTime DateTime OUT
+
+????
+
+AS
+
+BEGIN
+
+????SET NOCOUNT ON
+
+????
+
+????-- Normalize the paths
+
+????IF RIGHT (@datafile_dir, 1) != '\' SET @datafile_dir += '\' 
+
+????IF RIGHT (@logfile_dir, 1) != '\' SET @logfile_dir += '\' 
+
+????IF RIGHT (@fulltext_root, 1) != '\' SET @fulltext_root += '\' 
+
+????
+
+????DECLARE 
+
+????????@msg_err_no_fullback VARCHAR(200) = 'Fullbackup for database %s not find in any of the backup files',
+
+????????@cmd_filelist_fmt VARCHAR(2000) = 'RESTORE FILELISTONLY FROM DISK=''{bkfile}''',
+
+????????@cmd_restore_db_fmt VARCHAR(2000) = 'RESTORE DATABASE [{database}] FROM DISK=''{bkfile}'' WITH FILE={position}, NORECOVERY, REPLACE',
+
+????????@cmd_movedatafile_fmt VARCHAR (2000) = ', MOVE ''{lname}'' TO ''{dir}{dbfile}_data_{filenbr}.{ext}''',
+
+????????@cmd_movelogfile_fmt VARCHAR (2000) = ', MOVE ''{lname}'' TO ''{dir}{dbfile}_log_{filenbr}.{ext}''',
+
+????????@cmd_moveftfile_fmt VARCHAR(2000) = ', MOVE ''{lname}'' TO ''{ftdir}''',
+
+????????@cmd_restore_log_fmt VARCHAR(2000) = 'RESTORE LOG [{database}] FROM DISK=''{bkfile}'' WITH FILE={position}, NORECOVERY',
+
+????????@cmd_recover_fmt VARCHAR(500) = 'RESTORE DATABASE [{database}] WITH RECOVERY', 
+
+????????@dbname_new_fmt VARCHAR(500) = '{instance}_{database}',
+
+
+
+????????@cmd VARCHAR(2000),
+
+
+
+????????@dbname VARCHAR(128),
+
+????????@instance VARCHAR(128),
+
+????????@diskfile VARCHAR(500),
+
+????????@position SMALLINT,
+
+????????@lsn NUMERIC(25,0),
+
+????????@recoverymodel NVARCHAR(60),
+
+????????@backupstartdate DATETIME,
+
+????????@logicaldatafile SYSNAME,
+
+????????@logicallogfile SYSNAME,
+
+
+
+????????@lname NVARCHAR(128), 
+
+????????@phname NVARCHAR(260), 
+
+????????@type CHAR(1),
+
+????????@db_filenr INT = 0, 
+
+????????@log_filenr INT = 0, 
+
+????????@ext VARCHAR(3),
+
+????????@dbfilelist dbo.RestoreFileLisOnlytOutput
+
+????????
+
+????
+
+????SELECT TOP 1 @diskfile = diskfilename, @position = position, 
+
+????????????????@instance = servername, @dbname = databasename, @recoverymodel = recoverymodel, 
+
+????????????????@lsn = lastlsn, @backupstartdate = backupstartdate
+
+????FROM @backupinfo 
+
+????WHERE backuptype = 1 
+
+????ORDER BY firstlsn DESC, backupstartdate DESC
+
+
+
+????IF @@rowcount = 0 
+
+????BEGIN 
+
+????????RAISERROR (@msg_err_no_fullback, 16, 1, @dbname)
+
+????????RETURN 2
+
+????END 
+
+
+
+/************************************************************************************
+
+* Restore database full backup
+
+*************************************************************************************/
+
+SET @cmd = REPLACE(@cmd_filelist_fmt, '{bkfile}', @diskfile)
+
+INSERT @dbfilelist EXEC ( @cmd ) 
+
+
+
+SET @NewDBName = REPLACE(REPLACE(REPLACE(@dbname_new_fmt, '{instance}', @instance), '{database}', @dbname), '\', '$') 
+
+DECLARE @new_ft_dir VARCHAR(500) = @fulltext_root + @NewDBName + '_ft\'
+
+
+
+-- delete @new_ft_dir if exists
+
+
+
+-- main segment of restore database statement
+
+SET @cmd = REPLACE(REPLACE(REPLACE(@cmd_restore_db_fmt, '{database}', @NewDBName), '{bkfile}', @diskfile), '{position}', CAST(@position AS VARCHAR(5))) 
+
+SET @FullbackupTime = @backupstartdate
+
+
+
+-- move files 
+
+DECLARE cur_dbfile CURSOR FOR
+
+????SELECT lname, phname, [type] FROM @dbfilelist
+
+????
+
+OPEN cur_dbfile 
+
+WHILE 1 = 1
+
+BEGIN
+
+ FETCH NEXT FROM cur_dbfile INTO @lname, @phname, @type
+
+????IF @@fetch_status <> 0 BREAK
+
+????
+
+????IF @type = 'D'
+
+????BEGIN
+
+????????SET @db_filenr += 1 
+
+????????SET @cmd += REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@cmd_movedatafile_fmt,
+
+????????????????????????????'{lname}', @lname), 
+
+????????????????????????????'{dir}', @datafile_dir), 
+
+????????????????????????????'{dbfile}', @NewDBName), 
+
+????????????????????????????'{filenbr}', cast(@db_filenr as VARCHAR(2))), 
+
+????????????????????????????'{ext}', CASE @db_filenr WHEN 1 THEN 'mdf' ELSE 'ndf' END)
+
+????END
+
+????ELSE IF @type = 'L'
+
+????BEGIN
+
+????????SET @log_filenr += 1
+
+????????SET @cmd += REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@cmd_movelogfile_fmt,
+
+????????????????????????????'{lname}', @lname), 
+
+????????????????????????????'{dir}', @logfile_dir), 
+
+????????????????????????????'{dbfile}', @NewDBName), 
+
+????????????????????????????'{filenbr}', cast(@log_filenr AS VARCHAR(2))), 
+
+????????????????????????????'{ext}', 'ldf')
+
+????END
+
+????ELSE IF @type = 'F'
+
+????BEGIN
+
+????????SET @cmd += replace(replace(@cmd_moveftfile_fmt, 
+
+????????????????????????????'{lname}', @lname), 
+
+????????????????????????????'{ftdir}', @new_ft_dir)
+
+????END
+
+END
+
+
+
+CLOSE cur_dbfile
+
+DEALLOCATE cur_dbfile
+
+
+
+BEGIN TRY
+
+????EXEC (@cmd)
+
+END TRY
+
+BEGIN CATCH
+
+????RETURN ERROR_NUMBER() 
+
+END CATCH 
+
+
+
+/************************************************************************************
+
+* Restore log files 
+
+*************************************************************************************/
+
+IF @recoverymodel IS NULL OR @recoverymodel != 'SIMPLE'
+
+WHILE 1 = 1
+
+BEGIN
+
+????SELECT TOP 1 @diskfile = diskfilename, @position = position, 
+
+????????????????@instance = servername, @dbname = databasename, @recoverymodel = recoverymodel, 
+
+????????????????@lsn = lastlsn, @backupstartdate = backupstartdate
+
+????????FROM @backupinfo 
+
+????????WHERE backuptype = 2 and firstlsn <= @lsn and lastlsn >= @lsn and backupstartdate > @backupstartdate
+
+????????ORDER BY backupstartdate DESC 
+
+????
+
+????IF @@rowcount = 0 BREAK
+
+
+
+????SET @cmd = REPLACE(REPLACE(REPLACE(@cmd_restore_log_fmt, '{database}', @NewDBName), '{bkfile}', @diskfile), '{position}', CAST(@position AS VARCHAR(5))) 
+
+ SET @LastLogBackupTime = @backupstartdate
+
+ 
+
+BEGIN TRY
+
+????EXEC (@cmd)
+
+END TRY
+
+BEGIN CATCH
+
+????RETURN ERROR_NUMBER()
+
+END CATCH 
+
+
+
+END
+
+
+
+/************************************************************************************
+
+* Rescover database 
+
+*************************************************************************************/
+
+SET @cmd = REPLACE(@cmd_recover_fmt, '{database}', @NewDBName)
+
+
+
+BEGIN TRY
+
+????EXEC (@cmd)
+
+END TRY
+
+begin catch
+
+????RETURN ERROR_NUMBER()
+
+END CATCH 
+
+
+
+END
+
+GO
+
+
+
+/****** Object: StoredProcedure [dbo].[_admsp_LogVerificationResult] Script Date: 06/15/2011 12:21:38 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+/*************************************************************************
+
+* Description:????
+
+* Log the steps and results of backup verification
+
+* Internal procedure, called by dbo.admsp_VerifyBackups only
+
+**************************************************************************/
+
+CREATE PROCEDURE [dbo].[_admsp_LogVerificationResult]
+
+????@BatchStartTime DATETIME, 
+
+????@Instance VARCHAR(128),
+
+????@Folder VARCHAR(128),
+
+????@Database VARCHAR(128),
+
+????@Description VARCHAR(500),
+
+????@Result INT,
+
+????@Info VARCHAR(200),
+
+????@Message VARCHAR(max) = NULL
+
+AS
+
+BEGIN
+
+????SET NOCOUNT ON;
+
+????INSERT INTO dbo.BackupVerificationResult (BatchStartTime, InstanceName, FolderName, DatabaseName, [Description], Result, Info, [Message], LogDateTime)
+
+????????VALUES(@BatchStartTime, @Instance, @Folder, @Database, @Description, @Result, @Info, @Message, GETDATE())
+
+END
+
+GO
+
+
+
+/****** Object: StoredProcedure [dbo].[_admsp_InventoryBackupFiles] Script Date: 06/15/2011 12:21:38 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+/******************************************************************************
+
+* Inventory the backup files discovered by admsp_VerifyBackups 
+
+*
+
+* Internal procedure, called by dbo.admsp_VerifyBackups only
+
+******************************************************************************/
+
+CREATE PROC [dbo].[_admsp_InventoryBackupFiles]????
+
+????@BackupInfo dbo.BackupInfo READONLY, 
+
+????@BatchStartTime DATETIME = NULL,
+
+????@InventoryTime DATETIME = NULL
+
+AS
+
+IF @BatchStartTime IS NULL SET @BatchStartTime = GETDATE()
+
+IF @InventoryTime IS NULL SET @InventoryTime = GETDATE()
+
+
+
+MERGE INTO dbo.BackupFiles AS target
+
+USING @BackupInfo AS source ON (target.DiskFileName=source.DiskFileName and target.position=source.position and target.FirstLSN=source.FirstLSN and target.BackupStartDate=source.BackupStartDate)
+
+WHEN MATCHED THEN 
+
+????UPDATE SET LastCheckTime = @InventoryTime, LastBatchStartTime = @BatchStartTime, IsDeleted = 0
+
+WHEN NOT MATCHED THEN
+
+????INSERT (DiskFileName,BackupName,BackupDescription,BackupType,ExpirationDate,Compressed,Position,DeviceType,UserName,ServerName,DatabaseName,DatabaseVersion,DatabaseCreationDate,BackupSize,FirstLSN,LastLSN,CheckpointLSN,DatabaseBackupLSN,BackupStartDate,BackupFinishDate,SortOrder,CodePage,UnicodeLocaleId,UnicodeComparisonStyle,CompatibilityLevel,SoftwareVendorId,SoftwareVersionMajor,SoftwareVersionMinor,SoftwareVersionBuild,MachineName,Flags,BindingID,RecoveryForkID,Collation,FamilyGUID,HasBulkLoggedData,IsSnapshot,IsReadOnly,IsSingleUser,HasBackupChecksums,IsDamaged,BeginsLogChain,HasIncompleteMetaData,IsForceOffline,IsCopyOnly,FirstRecoveryForkID,ForkPointLSN,RecoveryModel,DifferentialBaseLSN,DifferentialBaseGUID,BackupTypeDescription,BackupSetGUID,CompressedBackupSize, FirstCheckTime, LastCheckTime, LastBatchStartTime)
+
+????VALUES (DiskFileName,BackupName,BackupDescription,BackupType,ExpirationDate,Compressed,Position,DeviceType,UserName,ServerName,DatabaseName,DatabaseVersion,DatabaseCreationDate,BackupSize,FirstLSN,LastLSN,CheckpointLSN,DatabaseBackupLSN,BackupStartDate,BackupFinishDate,SortOrder,CodePage,UnicodeLocaleId,UnicodeComparisonStyle,CompatibilityLevel,SoftwareVendorId,SoftwareVersionMajor,SoftwareVersionMinor,SoftwareVersionBuild,MachineName,Flags,BindingID,RecoveryForkID,Collation,FamilyGUID,HasBulkLoggedData,IsSnapshot,IsReadOnly,IsSingleUser,HasBackupChecksums,IsDamaged,BeginsLogChain,HasIncompleteMetaData,IsForceOffline,IsCopyOnly,FirstRecoveryForkID,ForkPointLSN,RecoveryModel,DifferentialBaseLSN,DifferentialBaseGUID,BackupTypeDescription,BackupSetGUID,CompressedBackupSize, @InventoryTime, @InventoryTime, @BatchStartTime);
+
+GO
+
+
+
+/****** Object: StoredProcedure [dbo].[admsp_VerifyBackups] Script Date: 06/15/2011 12:21:38 ******/
+
+SET ANSI_NULLS ON
+
+GO
+
+SET QUOTED_IDENTIFIER ON
+
+GO
+
+/***********************************************************************************************************************
+
+Restore databases and verify them with dbcc checkdb
+
+
+
+Dependencies:
+
+ Configuration: dbo.RestoreConfig
+
+ Restore: dbo._admsp_RestoreDatabase
+
+ Logging: dbo._admsp_LogVerificationResult, dbo._admsp_InventoryBackupFiles
+
+ Outputs (via logging): dbo.BackupVerificationResult, dbo.BackupFiles
+
+ User Defined Types: dbo.RestoreFileLisOnlytOutput, dbo.RestoreHeaderOnlyOutput, dbo.BackupInfo
+
+
+
+ 
+
+************************************************************************************************************************/
+
+CREATE PROC [dbo].[admsp_VerifyBackups]
+
+AS
+
+SET NOCOUNT ON
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+
+-- Begin initialization
+
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+-- Define local variables
+
+DECLARE @ProcName VARCHAR (128) = object_name(@@PROCID)
+
+
+
+DECLARE 
+
+????@MSG_VERIFICATIONSTART VARCHAR(500) = 'Verification start',
+
+????@MSG_VERIFICATIONEND VARCHAR(500) = 'Verification end',
+
+????@MSG_INSTANCEVERIFICATIONSTART VARCHAR(500) = 'Instance verification start',
+
+????@MSG_INSTANCEVERIFICATIONEND VARCHAR(500) = 'Instance verification end',
+
+????@MSG_FOLDERVERIFICATIONSTART VARCHAR(500) = 'Folder verification start',
+
+????@MSG_FOLDERVERIFICATIONEND VARCHAR(500) = 'Folder verification end',
+
+????@MSG_EMPTYINSTANCE VARCHAR(500) = 'Instance is empty or instance root not exist',
+
+????@MSG_EMPTYFOLDER VARCHAR(500) = 'Folder is empty',
+
+????@MSG_DBVERIFICATIONSTART VARCHAR(500) = 'Database verification start',
+
+????@MSG_DBVERIFICATIONEND VARCHAR(500) = 'Database verification end',
+
+????@MSG_ERROR_READINGROOT VARCHAR(500) = 'Error read database backup folders at instance root', 
+
+????@MSG_ERROR_DBRESTORE VARCHAR(500) = 'Database restore error',
+
+ @MSG_SUCCESS_DBRESTORE VARCHAR(500) = 'Database restore success',
+
+????@MSG_ERROR_DBCC VARCHAR(500) = 'DBCC error',
+
+????@Batchstart DATETIME = getdate(),
+
+????@InstanceCheckStart DATETIME,
+
+????
+
+????@FullbackupTime DATETIME, 
+
+????@LastLogBackupTime DATETIME,
+
+????@RestoreMessage VARCHAR(500)
+
+????
+
+DECLARE 
+
+????@filepath_fmt VARCHAR (500) = '{instanceroot}{dir}{file}',
+
+????@cmd VARCHAR(150),
+
+????@result INT,
+
+????@msg VARCHAR(500)
+
+????
+
+DECLARE????
+
+????@instance VARCHAR(128),
+
+????@InstanceRoot VARCHAR(500),
+
+????@filename VARCHAR(200), 
+
+????@dir VARCHAR(200),
+
+????@fullfilepath VARCHAR(500),
+
+????@folder VARCHAR(128),
+
+????@file VARCHAR(200),
+
+????@database VARCHAR(128),
+
+????@NewDBName VARCHAR(128),
+
+????@cmd_restore_header VARCHAR(500)
+
+
+
+DECLARE 
+
+????@bkfileheader dbo.RestoreHeaderOnlyOutput,
+
+????@DB_BackupInfo dbo.BackupInfo
+
+
+
+-- Define and initialize temp tables 
+
+IF object_id('tempdb..#bkfileheaders') IS NOT NULL DROP TABLE #bkfileheaders
+
+SELECT @folder AS Folder, @fullfilepath AS DiskFileName, * INTO #bkfileheaders FROM @bkfileheader
+
+
+
+IF object_id('tempdb..#files') IS NOT NULL DROP TABLE #files 
+
+CREATE TABLE #files ( rownbr INT IDENTITY (1,1), sub VARCHAR(2000), depth INT, isfile BIT )
+
+
+
+
+
+DECLARE @Default_DataDir VARCHAR(255), @Default_LogDir VARCHAR(255)
+
+SELECT @Default_DataDir = Dist_Datafile_Dir, @Default_LogDir = Dist_Logfile_Dir FROM dbo.RestoreConfig WHERE lvl = 0
+
+
+
+-- End of intialization
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, '', '', '', @MSG_VERIFICATIONSTART, 0, @ProcName
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+
+-- Get all file headers
+
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+-- Start loop for every row/instance in RestoreConfigure table here
+
+DECLARE cur_inst CURSOR FOR
+
+????SELECT SourceRoot, InstanceName FROM dbo.RestoreConfig WHERE lvl = 1 AND [Enable] = 1
+
+
+
+OPEN cur_inst
+
+
+
+WHILE 1 = 1
+
+BEGIN -- cur_inst
+
+FETCH cur_inst INTO @InstanceRoot, @Instance
+
+IF @@FETCH_STATUS <> 0 BREAK
+
+
+
+SET @InstanceCheckStart = GETDATE()
+
+
+
+-- normalize @instanceroot
+
+IF RIGHT (@InstanceRoot, 1) != '\' SET @InstanceRoot += '\' 
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', '', @MSG_INSTANCEVERIFICATIONSTART, 0, @ProcName
+
+
+
+-- get files
+
+INSERT #files (sub, depth, isfile)
+
+ EXEC master.sys.xp_dirtree @InstanceRoot, 2, 1 
+
+
+
+-- If we get nothing it could be that the instance has not begun backup to the share or the share is not accessible 
+
+IF @@ROWCOUNT = 0 
+
+BEGIN
+
+ EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', '', @MSG_EMPTYINSTANCE, 1, @ProcName
+
+
+
+END 
+
+
+
+-- loop through sub folders
+
+DECLARE cur_folders cursor for
+
+????SELECT sub FROM #files WHERE depth = 1 AND isfile = 0
+
+????UNION 
+
+????SELECT top 1 '' FROM #files WHERE depth = 1 AND isfile = 1 ???? -- files in instance root
+
+
+
+
+
+OPEN cur_folders 
+
+WHILE 1 = 1
+
+BEGIN -- cur_folder
+
+FETCH cur_folders INTO @folder
+
+IF @@FETCH_STATUS <> 0 BREAK
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, @folder, '', @MSG_FOLDERVERIFICATIONSTART, 0, @ProcName
+
+
+
+-- loop through files
+
+DECLARE cur_files cursor static for 
+
+SELECT [filename] FROM 
+
+( 
+
+????SELECT sub AS [filename], ( SELECT TOP 1 sub FROM #files 
+
+????????????????????????????????WHERE depth = 1 AND isfile = 0 AND rownbr < t.rownbr 
+
+????????????????????????????????ORDER BY rownbr DESC ) AS dir
+
+????FROM #files t
+
+????WHERE depth = 2 AND isfile = 1 
+
+) t WHERE @folder != '' AND dir = @folder
+
+UNION 
+
+SELECT sub FROM #files WHERE depth = 1 AND isfile = 1 AND @folder = ''
+
+
+
+OPEN cur_files
+
+
+
+IF (@@CURSOR_ROWS = 0 AND @folder != '') 
+
+BEGIN
+
+????SET @msg = @MSG_EMPTYFOLDER
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, @folder, '', @msg , 1, @ProcName, @folder
+
+END
+
+
+
+-- normalize @folder (after used in the cursor in its original form)
+
+IF (@folder != '' AND RIGHT (@folder, 1) != '\') SET @folder += '\' 
+
+
+
+WHILE 1 = 1
+
+BEGIN -- cur_files
+
+FETCH cur_files INTO @file
+
+IF @@FETCH_STATUS <> 0 BREAK
+
+
+
+BEGIN TRY
+
+????SET @fullfilepath = REPLACE(REPLACE(REPLACE(@filepath_fmt, '{instanceroot}', @instanceroot), '{dir}', @folder), '{file}', @file)
+
+????SET @cmd_restore_header = 'RESTORE HEADERONLY FROM DISK=''' + @fullfilepath + ''''
+
+
+
+????INSERT INTO @bkfileheader EXEC (@cmd_restore_header) 
+
+????INSERT INTO #bkfileheaders SELECT @folder, @fullfilepath, * FROM @bkfileheader
+
+????
+
+END TRY
+
+BEGIN CATCH
+
+????SET @result = ERROR_NUMBER()
+
+????SET @msg = ERROR_MESSAGE()
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, @folder, '', @msg , @result, @ProcName, @fullfilepath
+
+END CATCH
+
+
+
+DELETE @bkfileheader
+
+
+
+END -- cur_files
+
+CLOSE cur_files
+
+DEALLOCATE cur_files
+
+
+
+END -- cur_folders
+
+CLOSE cur_folders
+
+DEALLOCATE cur_folders
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------
+
+-- Got headers, now do restore
+
+--------------------------------------------------------------------------------------------------------------------
+
+
+
+DECLARE cur_db Cursor for
+
+????SELECT DISTINCT ServerName, DatabaseName FROM #bkfileheaders
+
+
+
+OPEN cur_db
+
+WHILE 1 = 1
+
+BEGIN
+
+
+
+SET @FullbackupTime = NULL
+
+SET @LastLogBackupTime = NULL
+
+
+
+FETCH cur_db INTO @instance, @database
+
+IF @@FETCH_STATUS <> 0 BREAK
+
+
+
+INSERT @DB_BackupInfo SELECT * FROM #bkfileheaders WHERE ServerName = @instance AND DatabaseName = @database 
+
+IF @@ROWCOUNT = 0 BEGIN
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database , 'No backup files', 1, @ProcName
+
+END
+
+ELSE
+
+BEGIN TRY
+
+ 
+
+????-- merge with BackupFiles table so we get detailed info about backup files
+
+????EXEC [_admsp_InventoryBackupFiles] @DB_BackupInfo, @BatchStart, @InstanceCheckStart
+
+
+
+????-- Log restore start
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database , @MSG_DBVERIFICATIONSTART, 0, @ProcName
+
+????
+
+????-- Restore 
+
+????EXEC @result = _admsp_RestoreDatabase @DB_BackupInfo, @Default_DataDir, @Default_LogDir, @Default_DataDir, @NewDBName OUT, @FullbackupTime OUT, @LastLogBackupTime OUT
+
+????
+
+????SET @RestoreMessage = 'FullBackupTime:' + ISNULL(CONVERT(VARCHAR(20), @FullbackupTime, 120), '(NONE)') + ', LastLogBackupTime:' + ISNULL(CONVERT(VARCHAR(20), @LastLogBackupTime, 120), '(NONE)') 
+
+????
+
+????IF @result > 0 BEGIN
+
+????????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @MSG_ERROR_DBRESTORE, @result, @ProcName, @RestoreMessage
+
+ END
+
+ ELSE BEGIN
+
+????????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @MSG_SUCCESS_DBRESTORE, 0, @ProcName, @RestoreMessage
+
+ END
+
+END TRY
+
+BEGIN CATCH
+
+????SET @result = ERROR_NUMBER()
+
+????SET @msg = ERROR_MESSAGE()
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @msg, @result, @ProcName, @RestoreMessage
+
+END CATCH
+
+
+
+IF @database != 'master' -- master restored as non-master database will fail on dbcc check. 
+
+BEGIN TRY
+
+????SET @cmd = 'DBCC CHECKDB ([' + @NewDBName + ']) WITH NO_INFOMSGS'
+
+????EXEC (@cmd)
+
+????SET @result = @@ERROR 
+
+????IF @result > 0 
+
+????????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @MSG_ERROR_DBCC, @result, @cmd
+
+END TRY
+
+BEGIN CATCH
+
+????SET @result = ERROR_NUMBER()
+
+????SET @msg = ERROR_MESSAGE()
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @msg, @result, @ProcName
+
+END CATCH
+
+
+
+IF DB_ID(@NewDBName) IS NOT NULL 
+
+BEGIN TRY
+
+????SET @cmd = 'DROP DATABASE [' + @NewDBName + ']'
+
+????EXEC (@cmd)
+
+END TRY
+
+BEGIN CATCH
+
+????SET @result = ERROR_NUMBER()
+
+????SET @msg = ERROR_MESSAGE()
+
+????EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database, @msg, @result, @ProcName
+
+END CATCH
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', @database , @MSG_DBVERIFICATIONEND, 0, @ProcName
+
+
+
+DELETE @DB_BackupInfo
+
+END
+
+
+
+CLOSE cur_db
+
+DEALLOCATE cur_db
+
+
+
+-- clear up
+
+TRUNCATE TABLE #bkfileheaders
+
+TRUNCATE TABLE #files
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, @Instance, '', '', @MSG_INSTANCEVERIFICATIONEND, 0, @ProcName
+
+
+
+END -- cur_inst 
+
+
+
+CLOSE cur_inst
+
+DEALLOCATE cur_inst
+
+
+
+EXEC [_admsp_LogVerificationResult] @batchstart, '', '', '', @MSG_VERIFICATIONEND, 0, @ProcName
+
+
+
+DROP TABLE #bkfileheaders
+
+DROP TABLE #files
+
+GO
+
+
+
+
+
+
+
+
+
+
+
+

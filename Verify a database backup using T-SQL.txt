@@ -1,0 +1,52 @@
+Verify a database backup using T-SQL
+
+The RESTORE command provides the facility to very easily validate a backup (taken via SQL Server, not via 3rd party utilities like SQLLite). This T-SQL code can help in ensuring that the backup file is structurally consistent, and therefore helps rule out I/O issues.
+
+The checks performed by RESTORE VERIFYONLY include (per Books On Line):
+
+    That the backup set is complete and all volumes are readable
+    Some header fields of database pages, such as the page ID (as if it were about to write the data)
+    Checksum (if present on the media)
+    Checking for sufficient space on destination devices
+
+This script has also been published on my blog at: http://beyondrelational.com/blogs/nakul/archive/2011/04/18/a-script-to-verify-a-database-backup.aspx
+
+ 
+
+Before running the script, please substitute the backup location and the code for the database files to suit your database configuration.
+
+
+
+
+/*
+THIS SCRIPT IS PROVIDED AS-IS AND WITHOUT WARRANTY.
+PLEASE ENSURE THAT IT UNDERGOES THOROUGH TESTING BEFORE PRODUCTION USE.
+THE AUTHOR OR THIS SITE ARE NOT RESPONSIBLE FOR DAMAGES CAUSED DUE TO MISUSE.
+*/
+USE MASTER
+-- Add a new backup device
+-- Ensure that the SQL Server can read from the physical location where the backup is placed
+--                    TYPE        NAME???????? PHYSICAL LOCATION
+EXEC SP_ADDUMPDEVICE 'disk','networkdrive','\\VPCW2K8\Database Backup\Test.bak'
+
+-- Execute the Restore operation in VERIFY ONLY mode
+-- Provide the actual paths where you plan to restore the database.
+-- This is because VERIFYONLY also checks for available space
+RESTORE
+VERIFYONLY
+FROM networkdrive
+WITH
+MOVE N'TESTDB_DATA' TO N'E:\TestDB\TestDB_Data.mdf', 
+MOVE N'TESTDB_INDEXES' TO N'E:\TestDB\TestDB_Idx.mdf', 
+MOVE N'TESTDB_LOG' TO N'E:\TestDB\TestDB_LOG.ldf'
+
+-- DROP THE DEVICE
+--                          Name , Physical File (OPTIONAL - if present, the file is deleted)
+EXEC SP_DROPDEVICE 'networkdrive'
+
+
+
+
+
+
+

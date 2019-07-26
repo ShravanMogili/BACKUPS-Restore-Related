@@ -1,0 +1,77 @@
+ This script can be used for generating a restore script for multiple databases simuntaneoulsy in scenarion like restoring databases from producion to dev/uat environment, or automate any such restore.
+Execute the script in production or source environment  and this will generate restore script for all the user databases. 
+
+if object_id('tempdb.dbo.#database') is not null 
+
+    drop TABLE #database
+
+go
+
+create TABLE #database(id INT identity ,
+ name sysname,
+ logicalfileName Varchar(50),
+ DataFileName Varchar(50),
+ logicalfilePath Varchar(150),
+ DatafilePath Varchar(150)
+)
+
+go
+
+set nocount on
+
+declare @dbname sysname, @LogicalDataFile      sysname , @LogicalLogFile       sysname, @PhysicalDataFile     nvarchar(260) , @PhysicalLogFile      nvarchar(260)
+
+insert into #database(name)
+
+select name
+
+from sys.databases
+
+where name not in ('master','msdb','model', 'tempdb')
+order by name
+
+
+
+declare @id INT, @cnt INT, @sql NVARCHAR(max), @currentDb sysname;
+
+select @id = 1, @cnt = max(id)
+from #database
+
+while @id <= @cnt
+
+BEGIN
+
+select @dbname=name from #database where id=@id
+        
+ 
+-- Data file
+select  @LogicalDataFile = name
+        , @PhysicalDataFile = physical_name
+from    sys.master_files
+where   database_id = db_id(@DBName)
+        and type_desc = 'ROWS'
+ 
+-- Log file
+select  @LogicalLogFile = name
+        , @PhysicalLogFile = physical_name
+from    sys.master_files
+where   database_id = db_id(@DBName)
+        and type_desc = 'LOG'
+ 
+ 
+update #database 
+        set DataFileName= @LogicalDataFile 
+        ,logicalfileName= @LogicalLogFile
+        , Datafilepath =@PhysicalDataFile 
+        , logicalfilePath = @PhysicalLogFile 
+ where id=@id       
+ set @id = @id + 1;
+
+END
+
+--Change the destination path in below  syntax as per your envrionment 
+select 'RESTORE DATABASE ['+Name+'] FROM  DISK = N''F:\SQLBackup\Default\'+name+'.bak'' WITH  FILE = 1,  MOVE N'''+logicalfilename+''' TO N''F:\SQL\Logs\'+name+'_1.log'' ,MOVE N'''+DataFileName+''' TO N''F:\SQL\Logs\'+name+'_1.mdf'''
+from #database
+
+drop table #database
+go

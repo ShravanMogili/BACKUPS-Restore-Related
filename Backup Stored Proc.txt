@@ -1,0 +1,770 @@
+ This stored procedure was written to get around the lack of support for maintenance plans in MSDE (and to bypass using the naff SSIS-based maintenance plans in SQL 2005). The user specifies the type of backup (FULL, LOG or DIFFERENTIAL), the db name, the folder to hold the backup file and the retention period in days (anything older in the backup folder for the specified backup type is deleted). See usage instructions in the code or run the procedure with no parameters.
+
+The stored procedure also has a parameter for debugging. Set to 1 to have commands printed out during the execution of the procedure.
+
+23-Sep-2008 Update: I have been making updates to this script and posting them in the discussion forum but I have figured out how to update the original post. So I have.
+
+This version has improved long filename handling (i.e. it does now), options to backup all system, all user or all databases, support for file and filegroup backups (full and differential) and better checking of SQL Server version (some things work in 2005 but not in 2000).
+
+It is assumed that the version of SQL Server being used is 2005 SP2 or later or 2000 SP4 or later.
+
+
+
+
+
+
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+IF EXISTS (SELECT name FROM sysobjects WHERE name = 'usp_DBBackup' AND type = 'P')
+  DROP PROCEDURE dbo.usp_DBBackup;
+GO
+
+CREATE PROCEDURE [dbo].[usp_DBBackup]
+  @BackupType sysname = NULL,
+  @DBName sysname = NULL,
+  @FileOrGroup nvarchar(9) = NULL,
+  @FileOrGroupName nvarchar(400) = NULL,
+  @RootFilePath sysname = NULL,
+  @DaysOldBackupToDelete int = NULL,
+  @debug bit = 0
+AS
+-- ----------------------------------------------------------------------------
+-- Stored procedure to backup a specified database to a specified folder.
+-- Filename to backup to is based on date/time
+-- Also manages number of copies to keep by checking today's date, subtracting
+--   the specified number of days & looking at the filenames for a match
+-- Requries xp_cmdshell to be enabled
+-- Supports multiple files/filegroups when doing FILE or FILEGROUP backups
+-- Only supports multiple databases through the ALLSYS, ALLUSER & ALLDATABASES
+--   option
+-- 
+-- Who          When       What
+-- ------------ ---------- ----------------------------------------------------
+-- S.Duncan     21-04-2006 Created         
+-- S.Duncan     18-10-2007 Made use of xp_delete_file to handle removal of old
+--                           backup files
+-- S.Duncan     07-11-2007 xp_delete_file does not work with SQL 2000.  Made
+--                           alternative
+-- S.Duncan     08-11-2007 Added functionality to allow for log, full or
+--                           differential backups
+-- S.Duncan     12-11-2007 Added verify, tidy-up of msdb tables
+-- S.Duncan     14-07-2008 Improved handling of long folder/file names
+-- S.Duncan     19-08-2008 Added SQL version check
+--                         Added ALLSYS, ALLUSER, ALLDATABASES options 
+--                         Improved error checking, logging
+-- S.Duncan     19-09-2008 Added options for FILE and FILEGROUP backups
+--                         Improved version checking
+-- ----------------------------------------------------------------------------
+SET NOCOUNT ON;
+DECLARE @ErrMsg nvarchar(500),  -- used to hold/print error messages
+        @cmd nvarchar(4000),   -- used with EXEC|sp_executesql
+        @cmd2 nvarchar(4000),  -- used with EXEC|sp_executesql
+        @FileOrGroupListTblName sysname,  -- name of table holding list of files|filegroups
+        @BackupFile nvarchar(410),  -- path + filename for backup file
+        @Result tinyint,  -- captures result of xp_cmdshell calls
+        @maxcount int,  -- used to filter out rubbish from a dir command sent to a table
+        @filename nvarchar(255),  -- utilising GETDATE(), dynamically created backup file name
+        @fileage int,  -- used for determining file ages for deletion
+        @filedate datetime,  -- used for determining file ages for deletion
+        @dt datetime,  -- used for determining file ages for deletion
+        @ver nvarchar(4),  -- server version (in format e.g. 8.00)
+        @Param nvarchar(100),  -- Parameter(s) for sp_executesql calls
+        @returnchar sysname,  -- character data returned from sp_executesql call
+        @returnint int;  -- integer data returned from sp_executesql 
+
+CREATE TABLE #temptbl (id int IDENTITY(1,1), dirdetail varchar(255));  -- directory listing for deletion of old backup files
+CREATE TABLE #tempdbtbl (id int IDENTITY(1,1), dbname sysname);  -- list of databases to be backed up (used with ALLSYS, ALLUSER, ALLDATABASES)
+
+-- To avoid concurrency problems, create a table name with a random number appended
+-- Otherwise, may get multiple backups running at the same time trying to access
+--   or worse, delete the FileOrGroupList table.
+-- This table can't be a #temp table as it needs to be visible to an sp_executesql call
+SET @FileOrGroupListTblName = N'FileOrGroupList' + SUBSTRING(CAST(RAND() AS varchar(30)), 3, 7);
+SET @cmd = N'CREATE TABLE tempdb..' + @FileOrGroupListTblName + N' (id int IDENTITY (1,1), fname sysname);';
+EXEC sp_executesql @cmd;
+
+-- Initialise variables
+SET @ErrMsg = NULL;
+SET @cmd = NULL;
+SET @cmd2 = NULL;
+SET @maxcount = 6;
+SET @BackupType = UPPER(@BackupType);
+SET @ver = LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(12)), 4);
+
+-- Check version of SQL Server
+IF @ver NOT IN (N'8.00', N'9.00')
+BEGIN
+  SET @ErrMsg = N'This script is for use with SQL Server 2000 or SQL Server 2005 only!';
+  GOTO The_End;
+END;
+
+IF @debug = 1
+BEGIN
+  PRINT N'****************************';
+  PRINT N'@BackupType = [' + @BackupType + N']';
+  PRINT N'@DBName = [' + @DBName + ']';
+  PRINT N'@FileOrGroup = [' + COALESCE(@FileOrGroup, 'NULL') + N']';
+  PRINT N'@FileOrGroupName = [' + COALESCE(@FileOrGroupName, 'NULL') + N']';
+  PRINT N'@RootFilePath = [' + @RootFilePath + N']';
+  PRINT N'@DaysOldBackupToDelete = [' + CAST(@DaysOldBackupToDelete AS varchar(2)) + N']';
+  PRINT N'@ver = [' + @ver + N']';
+END;
+
+-- Check parameters provided
+IF (@BackupType IS NULL) AND (@DBName IS NULL) AND (@FileOrGroup IS NULL) AND (@FileOrGroupName IS NULL) AND (@RootFilePath IS NULL) AND (@DaysOldBackupToDelete IS NULL) 
+BEGIN
+  SET @ErrMsg = N'Usage:  usp_DBBackup @BackupType = ''FULL|LOG|DIFFERENTIAL'', @DBName = ''<dbname>|ALLSYS|ALLUSER|ALLDATABASES'', @FileOrGroup = ''FILE|FILEGROUP|NULL'', @FileOrGroupName = ''<file|filegroup name>,n...>|NULL'', @RootFilePath = ''<backup folder>'', @DaysOldBackupToDelete = #num of days to retain backups [,@debug = 1 (default is 0)]';
+  SET @ErrMsg = @ErrMsg + N'E.g. usp_DBBackup ''FULL'', ''master'', NULL, NULL, ''c:\mssql\backup\'', 3';
+  SET @ErrMsg = @ErrMsg + N'Note the trailing backlash in the backup path!';
+  SET @ErrMsg = @ErrMsg + N'ALLSYS will backup master, model, msdb';
+  SET @ErrMsg = @ErrMsg + N'ALLUSER will backup all online databases except master, model, msdb, tempdb';
+  SET @ErrMsg = @ErrMsg + N'ALLDATABASES will backup all online databases except tempdb';
+  GOTO The_End;
+END;
+
+IF (@BackupType <> N'FULL') AND (@BackupType <> N'LOG') AND (@BackupType <> N'DIFFERENTIAL') OR (@BackupType IS NULL)
+BEGIN
+  SET @ErrMsg = N'Backup type must be specified as either LOG, FULL or DIFFERENTIAL!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+IF ((@FileOrGroup IS NULL) OR (@FileOrGroup NOT IN (N'FILE', N'FILEGROUP'))) AND (@FileOrGroupName IS NOT NULL)
+BEGIN
+  SET @ErrMsg = N'You must specify FILE or FILEGROUP when supplying a file or filegroup name!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroupName IS NULL)
+BEGIN
+  SET @ErrMsg = N'You must specify a file or filegroup name to do a file or filegroup backup!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroup NOT IN (N'FILE', N'FILEGROUP'))
+BEGIN
+  SET @ErrMsg = N'When specifying a file or filegroup backup, you must use FILE or FILEGROUP!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroupName IS NOT NULL) AND (@DBName IN (N'ALLSYS', N'ALLUSER', N'ALLDATABASES'))
+BEGIN
+  SET @ErrMsg = N'You can only do a file or filegroup backup on a single database!';
+  GOTO The_End;
+END;
+
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroupName IS NOT NULL) AND (@BackupType = N'LOG')
+BEGIN
+  SET @ErrMsg = N'You cannot do a log backup of a file or filegroup!';
+  GOTO The_End;
+END;
+
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroupName IS NOT NULL) AND (DATABASEPROPERTYEX(@DBName, 'Recovery') = 'SIMPLE')
+BEGIN
+  SET @ErrMsg = N'You cannot do a file backup of a database using the SIMPLE recovery model!';
+  GOTO The_End;
+END;
+
+-- Split comma-delimited list of files/filegroups and put in a table
+IF (@FileOrGroup IS NOT NULL) AND (@FileOrGroupName IS NOT NULL)
+BEGIN
+  IF LEFT(@FileOrGroupName, 1) <> ','
+    SET @FileOrGroupName = ',' + @FileOrGroupName;
+
+  IF RIGHT(@FileOrGroupName, 1) <> ','
+    SET @FileOrGroupName = @FileOrGroupName + ',';
+
+  SET @cmd = N'INSERT INTO tempdb..'+ @FileOrGroupListTblName
+           + N' SELECT SUBSTRING(@FileOrGroupName, N + 1, CHARINDEX('','', @FileOrGroupName, N + 1) - N - 1) '
+           + N' FROM dbatools.dbo.Tally '
+           + N' WHERE N < LEN(@FileOrGroupName) '
+           + N' AND SUBSTRING(@FileOrGroupName, N, 1) = '',''; ';
+  SET @Param = N'@FileOrGroupName sysname';
+  EXEC sp_executesql @cmd, @Param, @FileOrGroupName;
+
+  SET @cmd = N'SELECT @returnint = COUNT(*) FROM tempdb..' + @FileOrGroupListTblName;
+  SET @Param = N'@returnint int OUTPUT';
+  EXEC sp_executesql @cmd, @Param, @returnint OUTPUT;
+
+  IF @returnint < 1
+  BEGIN
+    SET @ErrMsg = N'You must provide at least one file or filegroup name when specifying a FILE or FILEGROUP backup!';
+    SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+    GOTO The_End;
+  END;
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'FILE or FILEGROUP backup selected.  Files or filegroups to be backed up:';
+    SET @cmd = N'SELECT fname FROM tempdb..' + @FileOrGroupListTblName + N';';
+    EXEC sp_executesql @cmd;
+  END;
+
+END;
+
+IF (@RootFilePath IS NULL) OR (LTRIM(RTRIM(REPLACE(@RootFilePath, CHAR(9), ' '))) = '')
+BEGIN
+  SET @ErrMsg = N'You must supply a folder to backup to!  E.g - ''C:\MSSQL\BACKUP\''';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+ELSE
+BEGIN
+  -- Check for trailing slash.  If it isn't there, put it in.
+  IF (RIGHT(@RootFilePath, 1) <> N'\')
+    SET @RootFilePath = @RootFilePath + N'\';
+  SET @cmd = N'dir "' + @RootFilePath + N'"';
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'RootFilePath = ' + @cmd;
+  END;
+  EXEC @Result = master..xp_cmdshell @cmd, no_output;
+  IF (@Result <> 0)
+  BEGIN
+    SET @ErrMsg = N'You must supply a valid folder to backup to!  E.g - ''C:\MSSQL\BACKUP\''';
+    GOTO The_End;
+  END;
+END;
+
+IF @DaysOldBackupToDelete IS NULL
+BEGIN
+  SET @ErrMsg = N'You must supply the number of days (as an integer) to retain the backups for!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+IF (@DBName IS NULL) OR (LTRIM(RTRIM(REPLACE(@DBName, CHAR(9), ' '))) = '')
+BEGIN
+  SET @ErrMsg = N'You must supply the name of a database to backup (or specify ALLSYS, ALLUSER or ALLDATABASES)!';
+  SET @ErrMsg = @ErrMsg + CHAR(13) + CHAR(10) + N'Run dbo.usp_DBBackup with no arguments to list valid parameters';
+  GOTO The_End;
+END;
+
+-- select databases to be backed up if ALLSYS, ALLUSER or ALLDATABASES was specified
+IF UPPER(@DBName) = N'ALLSYS'
+BEGIN
+  IF @ver = N'8.00'
+  BEGIN
+    INSERT INTO #tempdbtbl
+      SELECT name 
+      FROM master..sysdatabases 
+      WHERE name IN (N'master', N'model', N'msdb')
+        AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+  END;
+  ELSE
+  BEGIN
+    INSERT INTO #tempdbtbl
+      SELECT name 
+      FROM master.sys.databases 
+      WHERE name IN (N'master', N'model', N'msdb')
+        AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+  END;
+END;
+ELSE 
+BEGIN
+  IF UPPER(@DBName) = N'ALLUSER'
+  BEGIN
+    IF @ver = N'8.00'
+    BEGIN
+      INSERT INTO #tempdbtbl
+        SELECT name 
+        FROM master..sysdatabases 
+        WHERE name NOT IN (N'master', N'model', N'msdb', N'tempdb')
+          AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO #tempdbtbl
+        SELECT name 
+        FROM master.sys.databases 
+        WHERE name NOT IN (N'master', N'model', N'msdb', N'tempdb')
+          AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+    END;
+  END;
+  ELSE IF UPPER(@DBName) = N'ALLDATABASES'
+       BEGIN
+         IF @ver = N'8.00'
+         BEGIN
+           INSERT INTO #tempdbtbl
+             SELECT name 
+             FROM master..sysdatabases 
+             WHERE name <> N'tempdb'
+               AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+         END;
+         ELSE
+         BEGIN
+           INSERT INTO #tempdbtbl
+             SELECT name 
+             FROM master.sys.databases 
+             WHERE name <> N'tempdb'
+               AND DATABASEPROPERTYEX(name, 'Status') = 'ONLINE';
+         END;
+       END;
+       ELSE
+       BEGIN
+         IF @ver = N'8.00'
+         BEGIN
+           IF NOT EXISTS (SELECT name from master..sysdatabases WHERE name = @DBName)
+           BEGIN
+             SET @ErrMsg = N'Database [' + @DBName + N'] cannot be backed up, it does not exist!';
+             GOTO The_End;
+           END;
+           ELSE IF (DATABASEPROPERTYEX(@DBName, 'Status') <> 'ONLINE')
+                BEGIN
+                  SET @ErrMsg = N'The database [' + @DBName + N'] must be online to be backed up!';
+                  GOTO The_End;
+                END;
+                ELSE
+                BEGIN
+                  INSERT INTO #tempdbtbl
+                    VALUES (@DBName);
+                END;
+         END;
+         ELSE
+         BEGIN
+           IF NOT EXISTS (SELECT name from master.sys.databases WHERE name = @DBName)
+           BEGIN
+             SET @ErrMsg = N'Database [' + @DBName + N'] cannot be backed up, it does not exist!';
+             GOTO The_End;
+           END;
+           ELSE IF (DATABASEPROPERTYEX(@DBName, 'Status') <> 'ONLINE')
+                BEGIN
+                  SET @ErrMsg = N'The database [' + @DBName + N'] must be online to be backed up!';
+                  GOTO The_End;
+                END;
+                ELSE
+                BEGIN
+                  INSERT INTO #tempdbtbl
+                    VALUES (@DBName);
+                END;
+         END;
+       END;
+END;
+
+
+-- check that database files specified actually exist
+IF (@FileOrGroup = N'FILE')
+BEGIN
+  IF @ver = N'8.00'
+  BEGIN
+    SET @cmd = N'SELECT TOP 1 @returnchar = fname '
+             + N'FROM tempdb..' + @FileOrGroupListTblName + N' fgl '
+             + N'WHERE fname NOT IN (SELECT name FROM [' + @DBName + N']..sysfiles);';
+  END;
+  ELSE
+  BEGIN
+    SET @cmd = N'SELECT TOP 1 @returnchar = fname '
+             + N'FROM tempdb..' + @FileOrGroupListTblName + N' fgl '
+             + N'WHERE fname NOT IN (SELECT name FROM [' + @DBName + N'].sys.database_files);';
+  END;
+
+  SET @Param = N'@returnchar sysname OUTPUT';
+  EXEC sp_executesql @cmd, @Param, @returnchar OUTPUT;
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'FILE @returnchar = ' + COALESCE(@returnchar, '[NULL]')
+  END;
+
+  IF (@returnchar IS NOT NULL)
+  BEGIN
+    SET @ErrMsg = N'The database file [' + @returnchar + N'] is not part of database [' + @DBName + N']!';
+    GOTO The_End;
+  END;
+END;
+
+-- check that database filegroups specified actually exist
+IF (@FileOrGroup = N'FILEGROUP')
+BEGIN
+  IF @ver = N'8.00'
+  BEGIN
+    SET @cmd = N'SELECT TOP 1 @returnchar = fname '
+             + N'FROM tempdb..' + @FileOrGroupListTblName + N' fgl '
+             + N'WHERE fname NOT IN (SELECT groupname FROM [' + @DBName + N']..sysfilegroups);';
+  END;
+  ELSE
+  BEGIN
+    SET @cmd = N'SELECT TOP 1 @returnchar = fname '
+             + N'FROM tempdb..' + @FileOrGroupListTblName + N' fgl '
+             + N'WHERE fname NOT IN (SELECT name FROM [' + @DBName + N'].sys.data_spaces);';
+  END;
+
+  SET @Param = N'@returnchar sysname OUTPUT';
+  EXEC sp_executesql @cmd, @Param, @returnchar OUTPUT;
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'FILEGROUP @returnchar = ' + COALESCE(@returnchar, '[NULL]')
+  END;
+
+  IF (@returnchar IS NOT NULL)
+  BEGIN
+    SET @ErrMsg = N'The database filegroup [' + @returnchar + N'] is not part of database [' + @DBName + N']!';
+    GOTO The_End;
+  END;
+END;
+
+
+IF @BackupType = N'LOG'
+BEGIN
+  DELETE FROM #tempdbtbl
+    WHERE DATABASEPROPERTYEX(DBName, 'Recovery') = 'SIMPLE';
+  IF (SELECT TOP 1 DBName FROM #tempdbtbl) IS NULL
+  BEGIN
+    SET @ErrMsg = N'All databases selected are in SIMPLE recovery model!  No log backups can be performed!';
+    GOTO The_End;
+  END;
+END;
+
+IF @debug = 1
+BEGIN
+  PRINT N'****************************';
+  PRINT N'The databases to be backed up are:';
+  SELECT DBName
+  FROM #tempdbtbl;
+END;
+
+DECLARE DBNameCursor CURSOR FAST_FORWARD FOR
+  SELECT DBName FROM #tempdbtbl;
+
+OPEN DBNameCursor;
+FETCH NEXT FROM DBNameCursor INTO @DBName;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'Backing up database [' + @DBName + N']';
+  END;
+  -- Remove any leading and trailing spaces from the database name.  Fouls up file creation otherwise.
+  SET @DBName = RTRIM(LTRIM(@DBName));
+
+  -- Check for existence of subdir to backup db to.  If not there, create it.
+  SET @cmd = N'if not exist "' + @RootFilePath + @DBName + N'\." (mkdir "' + @RootFilePath + @DBName + N'")';
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'Create subdir = ' + @cmd;
+  END;
+
+  EXEC @Result = master..xp_cmdshell @cmd, no_output;
+
+  IF (@Result <> 0)
+  BEGIN
+    SET @ErrMsg = N'Could not create backup subfolder!';
+    GOTO The_End;
+  END;
+
+  -- Create path + filename parameter for backup command
+  IF @BackupType = N'FULL'
+  BEGIN
+    IF @FileOrGroup = N'FILE'
+      SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_fbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.bak';
+    ELSE IF @FileOrGroup = N'FILEGROUP'
+           SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_fgbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.bak';
+         ELSE
+           SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_dbbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.bak';
+  END;
+  ELSE 
+    IF @BackupType = N'LOG'
+      SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_lbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.trn';
+    ELSE
+      IF @BackupType = N'DIFFERENTIAL'
+      BEGIN
+        IF @FileOrGroup = N'FILE'
+          SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_fbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.dif';
+        ELSE IF @FileOrGroup = N'FILEGROUP'
+               SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_fgbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.dif';
+             ELSE
+               SET @BackupFile = @RootFilePath + @DBName + N'\' + @DBName + N'_dbbackup_' + CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 112) + LEFT(REPLACE(CONVERT(char(8), CONVERT(datetime, GETDATE(), 103), 108), ':', ''), 4) + N'.dif';
+      END;
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'BackupFile = ' + @BackupFile;
+  END;
+
+  -- Backup database
+  IF @BackupType = N'LOG'
+    SET @cmd = N'BACKUP LOG [' + @DBName + N'] TO DISK = ''' + @BackupFile + N'''';
+  ELSE
+  BEGIN
+    IF @BackupType = N'FULL'
+    BEGIN
+      -- full database backup
+      IF @FileOrGroup IS NULL
+        SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] TO DISK = ''' + @BackupFile + N'''';
+      ELSE IF @FileOrGroup = N'FILE'
+           BEGIN
+             -- full file backup
+             SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] ';
+             SET @cmd2 = N'SELECT @returnchar = fname FROM tempdb..' + @FileOrGroupListTblName + N';';
+             SET @Param = N'@returnchar sysname OUTPUT';
+             EXEC sp_executesql @cmd2, @Param, @returnchar OUTPUT;
+             SET @cmd = @cmd + N'FILE = ''' + @returnchar + N''', '
+             SET @cmd = LEFT(@cmd, LEN(@cmd) - 1);
+             SET @cmd = @cmd + N' TO DISK = ''' + @BackupFile + N''';';
+           END;
+           ELSE
+           BEGIN
+             -- full filegroup backup
+             SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] ';
+             SET @cmd2 = N'SELECT @returnchar = fname FROM tempdb..' + @FileOrGroupListTblName + N';';
+             SET @Param = N'@returnchar sysname OUTPUT';
+             EXEC sp_executesql @cmd2, @Param, @returnchar OUTPUT;
+             SET @cmd = @cmd + N'FILEGROUP = ''' + @returnchar + N''', '
+             SET @cmd = LEFT(@cmd, LEN(@cmd) - 1);
+             SET @cmd = @cmd + N' TO DISK = ''' + @BackupFile + N''';';
+           END;
+    END;
+    ELSE
+    BEGIN
+      -- differential database backup
+      IF @FileOrGroup IS NULL
+        SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] TO DISK = ''' + @BackupFile + N''' WITH DIFFERENTIAL;';
+      ELSE IF @FileOrGroup = N'FILE'
+           BEGIN
+             -- differential file backup
+             SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] ';
+             SET @cmd2 = N'SELECT @returnchar = fname FROM tempdb..' + @FileOrGroupListTblName + N';';
+             SET @Param = N'@returnchar sysname OUTPUT';
+             EXEC sp_executesql @cmd2, @Param, @returnchar OUTPUT;
+             SET @cmd = @cmd + N'FILE = ''' + @returnchar + N''', '
+             SET @cmd = LEFT(@cmd, LEN(@cmd) - 1);
+             SET @cmd = @cmd + N' TO DISK = ''' + @BackupFile + N''' WITH DIFFERENTIAL;';
+           END;
+           ELSE
+           BEGIN
+             -- differential filegroup backup
+             SET @cmd = N'BACKUP DATABASE [' + @DBName + N'] ';
+             SET @cmd2 = N'SELECT @returnchar = fname FROM tempdb..' + @FileOrGroupListTblName + N';';
+             SET @Param = N'@returnchar sysname OUTPUT';
+             EXEC sp_executesql @cmd2, @Param, @returnchar OUTPUT;
+             SET @cmd = @cmd + N'FILEGROUP = ''' + @returnchar + N''', '
+             SET @cmd = LEFT(@cmd, LEN(@cmd) - 1);
+             SET @cmd = @cmd + N' TO DISK = ''' + @BackupFile + N''' WITH DIFFERENTIAL;';
+           END;
+    END;
+  END;
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'Backup command = ' + @cmd;
+  END;
+
+  EXEC (@cmd);
+
+  IF (@@ERROR <> 0)
+  BEGIN
+    SET @ErrMsg = N'Backup for database [' + @DBName + N'] failed!';
+    IF (SELECT COUNT(*) FROM #tempdbtbl) = 1
+      GOTO The_End;
+    ELSE
+    BEGIN
+      PRINT @ErrMsg;
+      RAISERROR (@ErrMsg, 16, 1) WITH LOG;
+    END;
+  END;
+
+  -- Verify backup
+  SET @cmd = N'RESTORE VERIFYONLY FROM DISK = ''' + @BackupFile + N'''';
+
+  IF @debug = 1
+  BEGIN
+    PRINT N'****************************';
+    PRINT N'Verify command = ' + @cmd;
+  END;
+  
+  EXEC (@cmd)
+
+  IF (@@ERROR <> 0)
+  BEGIN
+    SET @ErrMsg = N'Verify for database [' + @DBName + N'] failed!';
+    IF (SELECT COUNT(*) FROM #tempdbtbl) = 1
+      GOTO The_End;
+    ELSE
+    BEGIN
+      PRINT @ErrMsg;
+      RAISERROR (@ErrMsg, 16, 1) WITH LOG;
+    END;
+  END;
+
+  -- If backup was successful, remove the backup that is @DaysOldBackupToDelete days old
+  -- Slightly different code required for 2000/2005
+  IF @ver = N'9.00'
+  BEGIN
+    -- begin SQL 2005
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      PRINT N'Beginning backup deletion for SQL 2005';
+    END;
+
+    IF @BackupType = N'FULL'
+      SET @cmd = N'master..xp_delete_file 0,N''' + @RootFilePath + @DBName + N''',N''bak'',N''' + CONVERT(char(23), DATEADD(dd, -@DaysOldBackupToDelete, CONVERT(datetime, GETDATE(), 103)), 126) + N''',1';
+    ELSE
+      IF @BackupType = N'LOG'
+        SET @cmd = N'master..xp_delete_file 0,N''' + @RootFilePath + @DBName + N''',N''trn'',N''' + CONVERT(char(23), DATEADD(dd, -@DaysOldBackupToDelete, CONVERT(datetime, GETDATE(), 103)), 126) + N''',1';
+      ELSE
+        IF @BackupType = N'DIFFERENTIAL'
+          SET @cmd = N'master..xp_delete_file 0,N''' + @RootFilePath + @DBName + N''',N''dif'',N''' + CONVERT(char(23), DATEADD(dd, -@DaysOldBackupToDelete, CONVERT(datetime, GETDATE(), 103)), 126) + N''',1';
+
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      PRINT N'Delete old files from: ' + @cmd;
+    END;
+
+    EXEC (@cmd);
+
+    -- tidy up msdb tables
+    SELECT @dt = DATEADD(dd, -7, GETDATE());
+    EXEC msdb.dbo.sp_delete_backuphistory @dt;
+
+    SELECT @cmd = N'msdb..sp_purge_jobhistory @oldest_date=''' + CAST(@dt AS varchar(40)) + N'''';
+    EXEC (@cmd);
+
+    SELECT @cmd = N'msdb..sp_maintplan_delete_log null, null, ''' + CAST(@dt AS varchar(40)) + N'''';
+    EXEC (@cmd);
+
+  -- end SQL 2005
+  END;
+  ELSE
+  BEGIN
+  -- begin SQL 2000 version
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      PRINT N'Beginning backup deletion for SQL 2000';
+    END;
+
+    -- get directory listing, store in temp table
+    SET @cmd = N'dir "' + @RootFilePath + @DBName;
+
+    IF @BackupType = N'FULL'
+      SET @cmd = @cmd + N'\*.bak"';
+    ELSE
+      IF @BackupType = N'LOG'
+        SET @cmd = @cmd + N'\*.trn"';
+      ELSE
+        IF @BackupType = N'DIFFERENTIAL'
+          SET @cmd = @cmd + N'\*.dif"';
+
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      PRINT @cmd;
+    END;
+
+    INSERT INTO #temptbl
+      EXEC master..xp_cmdshell @cmd;
+  
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      SELECT * FROM #temptbl;
+    END;
+
+    -- remove rubbish from top & bottom of dir listing
+    DELETE FROM #temptbl
+    WHERE (id < 6)
+    OR (id > (CAST(SCOPE_IDENTITY() AS int) - 3));
+
+    IF @debug = 1
+    BEGIN
+      PRINT N'****************************';
+      SELECT * FROM #temptbl;
+    END;
+
+    -- check the creation date for each file.  
+    -- Delete the ones older than the specified retention period
+    -- @maxcount used to skip the first few rows of the folder listing
+    --   as it doesn't have file names, just other information
+    WHILE @maxcount <= (SELECT MAX(id) FROM #temptbl)
+    BEGIN
+      -- get create date + filename
+      SELECT @filedate = CONVERT(datetime, (SUBSTRING(dirdetail, 1, 10) + ' ' + 
+                         CASE UPPER(SUBSTRING(dirdetail, 19, 1))
+                           WHEN 'A' THEN SUBSTRING(dirdetail, 13, 5)
+                           WHEN 'P' THEN SUBSTRING(dirdetail, 13, 5) + 'PM'
+                         END ), 103),
+             @filename = SUBSTRING(dirdetail, 42, (LEN(dirdetail) - 41))
+      FROM #temptbl
+      WHERE id = @maxcount;
+
+      IF @debug = 1
+      BEGIN
+        PRINT N'****************************';
+        SELECT @filedate AS [filedate], CONVERT(datetime, GETDATE(), 103) AS [getdate], DATEDIFF(dd, @filedate, CONVERT(datetime, GETDATE(), 103)) AS [dif in days];
+      END;
+
+      IF (SELECT DATEDIFF(dd, @filedate, CONVERT(datetime, GETDATE(), 103))) > @DaysOldBackupToDelete
+      BEGIN
+        IF @debug = 1
+        BEGIN
+          PRINT N'****************************';
+          SELECT N'File to delete:', @filename, @filedate;
+        END;
+
+        SET @cmd = N'del "' + @RootFilePath + @DBName + N'\' + @filename + N'"';
+
+        IF @debug = 1
+        BEGIN
+          PRINT N'****************************';
+          PRINT @cmd;
+          EXEC master..xp_cmdshell @cmd;
+        END;
+        ELSE
+          EXEC master..xp_cmdshell @cmd, no_output;
+      END;
+      SET @maxcount = @maxcount + 1;
+    END;
+
+    -- tidy up msdb tables
+    SELECT @dt = DATEADD(dd, -7, GETDATE());
+    EXEC msdb..sp_delete_backuphistory @dt;
+
+  TRUNCATE TABLE #temptbl;
+  -- end SQL 2000 version
+  END;
+  
+  Get_Next:
+  FETCH NEXT FROM DBNameCursor INTO @DBName;
+END;
+
+CLOSE DBNameCursor;
+DEALLOCATE DBNameCursor;
+
+-- clean up & exit
+DROP TABLE #temptbl;
+DROP TABLE #tempdbtbl;
+SET @cmd = N'DROP TABLE tempdb..' + @FileOrGroupListTblName + N';';
+EXEC sp_executesql @cmd;
+SET NOCOUNT OFF;
+RETURN;
+
+-- clean up, print error & exit
+The_End:
+DROP TABLE #temptbl;
+DROP TABLE #tempdbtbl;
+SET @cmd = N'DROP TABLE tempdb..' + @FileOrGroupListTblName + N';';
+EXEC sp_executesql @cmd;
+PRINT @ErrMsg;
+RAISERROR (@ErrMsg, 16, 1) WITH LOG;
+SET NOCOUNT OFF;
+RETURN;
+
+GO

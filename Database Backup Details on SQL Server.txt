@@ -1,0 +1,35 @@
+--Database Backup Details on SQL Server
+--Script helps to validate the database backup status of Full,Differential and Transactional Log backup.
+
+
+--Get Full Database Backups
+SELECT database_name, backup_start_date, type, *
+FROM msdb.dbo.backupset
+WHERE backup_start_date BETWEEN DATEADD(hh, -24, GETDATE()) AND GETDATE()
+AND Type = 'D'
+ORDER BY backup_set_id DESC
+GO
+
+--Get Transaction Log Backups
+SELECT database_name, backup_start_date, type, *
+FROM msdb.dbo.backupset
+WHERE backup_start_date BETWEEN DATEADD(hh, -24, GETDATE()) AND GETDATE()
+AND Type = 'L'
+ORDER BY backup_set_id DESC
+GO
+
+--Get Differential Backups details
+SELECT database_name, backup_start_date, type, *
+FROM msdb.dbo.backupset
+WHERE backup_start_date BETWEEN DATEADD(hh, -24, GETDATE()) AND GETDATE()
+AND Type = 'I'
+ORDER BY backup_set_id DESC
+GO
+
+--File\File Group Backups
+SELECT database_name, backup_start_date, type, *
+FROM msdb.dbo.backupset
+WHERE backup_start_date BETWEEN DATEADD(hh, -24, GETDATE()) AND GETDATE()
+AND Type = 'F'
+ORDER BY backup_set_id DESC
+GO

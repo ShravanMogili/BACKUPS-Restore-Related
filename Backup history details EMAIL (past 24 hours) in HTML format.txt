@@ -1,0 +1,84 @@
+--Backup history details EMAIL (past 24 hours) in HTML format
+
+ Step 1: Create the view in your dba management database.
+
+Step 2: Run the email section T-SQL which will send an email.
+
+FYI - You need to create database mail in SQL Server and enable all required mail properties prior to using this script.
+
+Reference : 
+
+http://msdn.microsoft.com/en-us/library/ms188298(v=sql.105).aspx
+
+http://msdn.microsoft.com/en-us/library/ms191189.aspx
+
+Step 3: Create a job which is scheduled to run daily executing the mail T-SQL script. (This script is not included)
+
+Reference:
+
+http://msdn.microsoft.com/en-us/library/ms190268(v=sql.105).aspx
+
+http://msdn.microsoft.com/en-us/library/ms187910(v=sql.105).aspx
+
+
+Use Cases:
+
+1. In a busy SQL Server where we have 100's of databases taken using scripts, maintenance plans, backup tape media etc to different locations and we don't know where the backup is located. 
+
+2. This script email will be handy to get the database name, backup date, backup time and backup location, which will be useful to inform the storage admin or backup admin for the location that needs to be restored from backup disk or tape.
+
+3. Audit for previous backups. If backup is not taken in servers like QA, DEV, UAT etc. 
+
+VIEW
+====
+
+Step 1: Create a view which is easy to manage.
+
+CREATE view [dbo].[Backup_Status] as SELECT sdb.name as Database_Name, 
+ISNULL(STR(ABS(DATEDIFF(day, GetDate(), MAX(Backup_finish_date)))), 'NO BACKUP') as DaysSinceLastBackup,
+ISNULL(Convert(varchar(20), MAX(backup_finish_date), 101), 'NOT APPLICABLE') as LastBackupDate,
+ISNULL(Convert(varchar(20), MAX(backup_finish_date), 108), 'NOT APPLICABLE') as LastBackupTime,
+bkpfmly.physical_device_name as File_Location
+FROM sys.sysdatabases sdb 
+LEFT OUTER JOIN msdb.dbo.backupset bkpst with (readpast) ON bkpst.database_name = sdb.name AND bkpst.type = 'D' 
+LEFT OUTER JOIN msdb.dbo.backupmediafamily bkpfmly with (readpast) ON bkpfmly.media_set_id = bkpst.media_set_id
+GROUP BY sdb.Name,physical_device_name
+HAVING CONVERT(nvarchar(10),MAX(Backup_finish_date),20) between CONVERT(nvarchar(10),(GETDATE() - 1),20) AND CONVERT(nvarchar(10),(GETDATE()),20)
+
+Note: This script provides the backup history for the past 24 hours. If you want more days than just 24 hours change the HAVING section.
+
+EX:- 3 days
+HAVING CONVERT(nvarchar(10),MAX(Backup_finish_date),20) between CONVERT(nvarchar(10),(GETDATE() - 3),20) AND CONVERT(nvarchar(10),(GETDATE()),20)
+ 
+In case you need the complete history of backup comment the HAVING section.
+
+HTML Email:
+===========
+
+DECLARE @xml NVARCHAR(MAX)
+DECLARE @body NVARCHAR(MAX)
+
+
+SET @xml = CAST(( SELECT [Database_Name] AS 'td','',[DaysSinceLastBackup] AS 'td','',
+       [LastBackupDate] AS 'td','', [LastBackupTime] AS 'td','',[File_Location] AS 'td',''
+FROM  Backup_Status ORDER BY LastBackupTime asc
+FOR XML PATH('tr'), ELEMENTS ) AS NVARCHAR(MAX))
+
+
+SET @body ='<html><body><H3>Please find the values for Database Backup details</H3>
+<table border = 1> 
+<tr>
+<th bgcolor="#66CCFF">  Database_Name </th> <th bgcolor="#66CCFF">  DaysSinceLastBackup </th> <th bgcolor="#66CCFF">  LastBackupDate </th> <th bgcolor="#66CCFF">  LastBackupTime </th> <th bgcolor="#66CCFF">  File_Location </th></tr>'    
+
+ 
+SET @body = @body + @xml +'</table></body></html>'
+
+
+EXEC msdb.dbo.sp_send_dbmail
+@profile_name = '<SQL Database Mail Profile Name>',
+@body = @body,
+@body_format ='HTML',
+@recipients = '<Notification Group email Address>',
+@subject ='SQL Server Backup Status' ;
+
+Please email me if you have any questions to cusvenus@hotmail.com

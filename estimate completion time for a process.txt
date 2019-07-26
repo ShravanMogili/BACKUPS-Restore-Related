@@ -1,0 +1,34 @@
+Using sys.dm_exec_requests to estimate completion time for a process
+
+http://www.sqlservercentral.com/scripts/sys.dm_exec_requests/75945/
+
+ Please note that sys.dm_exec_requests DMV is only available in SQL Server 2005 and later. 
+
+According to Books Online, the percentage of work completed (percent_complete column) value is available (not null) for the following commands:
+• ALTER INDEX REORGANIZE
+• AUTO_SHRINK option with ALTER DATABASE
+• BACKUP DATABASE
+• CREATE INDEX
+• DBCC CHECKDB
+• DBCC CHECKFILEGROUP
+• DBCC CHECKTABLE
+• DBCC INDEXDEFRAG
+• DBCC SHRINKDATABASE
+• DBCC SHRINKFILE
+• KILL (Transact-SQL)
+• RESTORE DATABASE,
+• UPDATE STATISTICS.
+
+SELECT session_id, 
+????start_time,
+????percent_complete, 
+????estimated_completion_time, 
+????estimated_completion_time/(1000*60) AS EstimatedCompletionTimeInMinutes
+FROM sys.dm_exec_requests
+WHERE command ='RESTORE DATABASE'
+--WHERE command ='BACKUP DATABASE'
+--WHERE session_id = 65
+ORDER BY estimated_completion_time
+
+
+

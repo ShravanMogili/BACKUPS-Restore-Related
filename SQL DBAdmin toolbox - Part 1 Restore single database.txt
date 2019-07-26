@@ -1,0 +1,445 @@
+SQL DBAdmin toolbox - Part 1 Restore single database
+
+http://www.sqlservercentral.com/scripts/Restore/73976/
+
+It is a good practice to have all the scripts you usually use in one single container. The best place is a small database, DBAdmin, which could be deployed in every SQL server instances in the company.
+
+This is my effort to make a "standard" toolbox for sql server dba and share it with the community, in the hope that it will be more contributions from others.
+
+This script is for SQL2008 and SQL2008R2. For other versions modifications will be needed since the RESTORE HEADERONLY and FILELISTONLY have different outputs.
+
+EDIT: Changed from ALTER PROC to CREATE PROC.
+
+Next - Part 2: Restore and verify all databases in the enterprise
+
+
+
+
+USE [DBAdmin]
+GO
+/****** Object: StoredProcedure [dbo].[admsp_RestoreDatabase] Script Date: 05/27/2011 15:53:25 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+/****************************************************
+* Last Changed 2011-06-10 
+*
+* Description:???? 
+*????Restore database and log backup file from all backup files in a directory 
+*????to the latest transaction backed up.
+*????
+* - Error-resilient against non-backup files within the directory
+* - Physical files are renamed
+* - Placement of files are configurable. All data files are placed together,
+* and all log files are placed together
+* 
+* 
+* Parameters:
+* @source_dir - directory where backup files are stored
+* @dbname - Original database name
+* @datafile_dir - Directories where physical data files are to be placed
+* @logfile_dir - Directories where physical log files are to be placed
+* @fulltext_root - the Freetext search related files will be placed under directory <@fulltext_root>\<@dbname>_FT\ 
+*????????This is for backwardcompatibility. 
+* @dbname_new - the restored database name (default = @dbname)
+* @RunMode 
+* - Restore: do the restore, it will stop if database with the same name exists. 
+* - ScriptOnly: generate scripts only (default)
+*
+*  Usage sample:
+*  To generate the restore scripts 
+*  EXEC admsp_RestoreDatabase '\\fileshare\sqlbackup$\server1', 'database1', 'D:\SQLData', 'L:\SQLLog'
+****************************************************/
+CREATE PROC [dbo].[admsp_RestoreDatabase] 
+????@source_dir varchar(255),
+  @dbname sysname,
+????@datafile_dir varchar(255),
+????@logfile_dir varchar(255),
+????@fulltext_root varchar(255) = NULL,
+????@dbname_new sysname = null,
+????@RunMode varchar(10) = 'ScriptOnly',
+????@InfoLevel varchar(10) = 'VERBOSE'
+
+AS
+SET NOCOUNT ON
+
+-- Set default
+IF @fulltext_root IS NULL SET @fulltext_root = @datafile_dir 
+
+----------------------------------------------------------------------
+-- Constants
+----------------------------------------------------------------------
+DECLARE @RESTORE varchar(10)
+SET @RESTORE = 'RESTORE'
+
+DECLARE @VERBOSE varchar(10), @SILENT varchar(10)
+SET @VERBOSE = 'VERBOSE'
+SET @SILENT = 'SILENT'
+
+DECLARE @NEWLINE varchar(1)
+SET @NEWLINE = ' '
+
+DECLARE @LOGDETAIL varchar(10), @LOGINFO varchar(10)
+SET @LOGDETAIL = 'DETAIL'
+SET @LOGINFO = 'INFO'
+
+---------------------------------------------------------------------
+-- Normalize directory names
+--------------------------------------------------------------------- 
+IF RIGHT (@source_dir, 1) != '\' SET @source_dir += '\' 
+IF RIGHT (@datafile_dir, 1) != '\' SET @datafile_dir += '\' 
+IF RIGHT (@logfile_dir, 1) != '\' SET @logfile_dir += '\' 
+IF RIGHT (@fulltext_root, 1) != '\' SET @fulltext_root += '\' 
+
+DECLARE 
+????@cmd_dir varchar(255),
+????@cmd_restore varchar(2000),
+????@diskfile nvarchar(128),
+????@new_FT_Dir varchar(255),
+
+????@LSN numeric(25,0),
+????@RecoveryModel nvarchar(60),
+????@BackupStartDate DateTime,
+????@LogicalDataFile sysname,
+????@LogicalLogFile sysname
+
+-- Set run mode --
+if @RunMode IS NULL OR @RunMode not in ('Restore', 'ScriptOnly') 
+????SET @RunMode = 'ScriptOnly'
+
+-- Print message 
+IF @InfoLevel != @SILENT 
+????PRINT '============================== RunMode ' + @RunMode + ' =============================='
+
+-- check and set @dbname_new 
+if @dbname_new is null or @dbname_new = ''
+????set @dbname_new = @dbname
+
+set @new_FT_Dir = @fulltext_root + @dbname + '_FT\'
+
+/***********************************************************
+* If Runmode is normal and database exists stop running 
+*
+***********************************************************/
+if @RunMode = @RESTORE AND Exists (select * from master.dbo.sysdatabases where name = @dbname_new) 
+begin
+????PRINT 'Database ' + @dbname_new + ' exists.' + char(10) + 'Change @dbname_new to a new name.'
+????RETURN 1
+end
+
+/******************************************************************************
+* Create or initialize temp files
+
+*******************************************************************************/
+IF object_id('tempdb..#tmp_diskfile') IS NOT NULL
+????Truncate TABLE #tmp_diskfile
+ELSE
+????create table #tmp_diskfile (bkfile varchar(255), depth int, [file] int)
+
+IF object_id('tempdb..#tmp_dbfile') IS NOT NULL
+ Truncate TABLE #tmp_dbfile
+ELSE
+????create table #tmp_dbfile (
+????????lName nvarchar(128), 
+????????phName nvarchar(260), 
+????????[Type] char(1), 
+????????fGrpName nvarchar(128), 
+????????[Size] numeric(25,0), 
+????????[MaxSize] numeric(25,0), 
+????????fileId BigInt, 
+????????CreateLSN numeric(25,0), 
+????????DropLSN numeric(25,0), 
+????????UniqueId UniqueIdentifier, 
+????????ReadOnlyLSN numeric(25,0), 
+????????ReadWriteLSN numeric(25,0), 
+????????BackupSizeInBytes bigInt, 
+????????SourceBlockSize int, 
+????????FileGroupId int, 
+????????LogGroupGuid UniqueIdentifier, 
+????????DiffBaseLSN numeric(25,0), 
+????????DiffBaseGuid UniqueIdentifier, 
+????????IsReadOnly bit, 
+????????IsPresent bit,
+????????-- only for 2008
+????????TDEThumbprint Decimal
+????)
+
+IF object_id('tempdb..#tmp_header') IS NOT NULL
+????Truncate TABLE #tmp_header
+ELSE
+????create table #tmp_header
+????(
+????????DiskFileName nvarchar(128) NULL,
+????????BackupName nvarchar(128),
+????????BackupDescription nvarchar(255),
+????????BackupType smallint,
+????????ExpirationDate datetime,
+????????Compressed tinyint,
+????????Position smallint,
+????????DeviceType tinyint,
+????????UserName nvarchar(128),
+????????ServerName nvarchar(128),
+????????DatabaseName nvarchar(128),
+????????DatabaseVersion int,
+????????DatabaseCreationDate datetime,
+????????BackupSize numeric(20,0),
+????????FirstLSN numeric(25,0),
+????????LastLSN numeric(25,0),
+????????CheckpointLSN numeric(25,0),
+????????DatabaseBackupLSN numeric(25,0),
+????????BackupStartDate datetime,
+????????BackupFinishDate datetime,
+????????SortOrder smallint,
+????????CodePage smallint,
+????????UnicodeLocaleId int,
+????????UnicodeComparisonStyle int,
+????????CompatibilityLevel tinyint,
+????????SoftwareVendorId int,
+????????SoftwareVersionMajor int,
+????????SoftwareVersionMinor int,
+????????SoftwareVersionBuild int,
+????????MachineName nvarchar(128),
+????????Flags int,
+????????BindingID uniqueidentifier,
+????????RecoveryForkID uniqueidentifier,
+????????Collation nvarchar(128),
+????????FamilyGUID uniqueidentifier NULL,
+????????HasBulkLoggedData bit NULL,
+????????IsSnapshot bit NULL,
+????????IsReadOnly bit NULL,
+????????IsSingleUser bit NULL,
+????????HasBackupChecksums bit NULL,
+????????IsDamaged bit NULL,
+????????BeginsLogChain bit NULL,
+????????HasIncompleteMetaData bit NULL,
+????????IsForceOffline bit NULL,
+????????IsCopyOnly bit NULL,
+????????FirstRecoveryForkID uniqueidentifier NULL,
+????????ForkPointLSN numeric(25,0) NULL,
+????????RecoveryModel nvarchar(60) NULL,
+????????DifferentialBaseLSN numeric(25,0) NULL,
+????????DifferentialBaseGUID uniqueidentifier NULL,
+????????BackupTypeDescription nvarchar(60) NULL,
+????????BackupSetGUID uniqueidentifier NULL,
+????????-- Only for 2008
+????????CompressedBackupSize numeric(20,0)
+)
+
+/*******************************************************************************
+* Enumerate disk files
+*
+********************************************************************************/
+insert #tmp_diskfile
+ exec master.sys.xp_dirtree @source_dir, 1, 1
+
+/*******************************************************************************
+* Get backup set headers for all files
+*
+********************************************************************************/
+declare cur_diskfile CURSOR FOR
+????select bkfile from #tmp_diskfile 
+
+open cur_diskfile
+
+fetch next from cur_diskfile into @diskfile
+while @@fetch_status = 0
+BEGIN
+????if @diskfile is not null
+????BEGIN TRY
+????????SET @cmd_restore = 'restore headeronly from disk=''' + @source_dir + @diskfile + ''''
+????????insert #tmp_header (BackupName, BackupDescription, BackupType, ExpirationDate,
+????????????Compressed, Position, DeviceType, UserName, ServerName, DatabaseName,????
+????????????DatabaseVersion, DatabaseCreationDate, BackupSize, FirstLSN, LastLSN,
+????????????CheckpointLSN, DatabaseBackupLSN, BackupStartDate, BackupFinishDate, SortOrder,
+????????????CodePage, UnicodeLocaleId, UnicodeComparisonStyle, CompatibilityLevel,
+????????????SoftwareVendorId, SoftwareVersionMajor, SoftwareVersionMinor, SoftwareVersionBuild,
+????????????MachineName, Flags, BindingID, RecoveryForkID, Collation, FamilyGUID, 
+????????????HasBulkLoggedData, IsSnapshot, IsReadOnly, IsSingleUser, HasBackupChecksums, IsDamaged,
+????????????BeginsLogChain, HasIncompleteMetaData, IsForceOffline, IsCopyOnly, FirstRecoveryForkID,
+????????????ForkPointLSN, RecoveryModel, DifferentialBaseLSN, DifferentialBaseGUID, 
+????????????BackupTypeDescription, BackupSetGUID, CompressedBackupSize) 
+????????????exec (@cmd_restore) 
+????
+????????????update #tmp_header set diskfilename = @diskfile where diskfilename IS NULL
+????END TRY
+????BEGIN CATCH
+
+????END CATCH
+
+????
+????fetch next from cur_diskfile into @diskfile
+END
+close cur_diskfile
+deallocate cur_diskfile
+
+/*********************************************************************************
+* Get the latest full backup
+*
+*********************************************************************************/
+select TOP 1 @diskfile = DiskFileName, @LSN = LastLSN, @RecoveryModel = RecoveryModel, @BackupStartDate = BackupStartDate
+????from #tmp_header 
+????where backuptype = 1 and DataBaseName = @dbname 
+????ORDER BY FirstLSN DESC, BackupStartDate DESC
+
+if @@rowcount = 0 
+BEGIN
+????RAISERROR ('Database %s not find in any of the full backup file(s)', 16, 1, @dbname)
+????return 2
+END 
+
+/************************************************************************************
+* Compose the Restore Database statement 
+* 
+*************************************************************************************/
+SET @cmd_restore = 'RESTORE FileListOnly from disk = ''' + @source_dir + @diskfile + '''' 
+
+INSERT #tmp_dbfile (
+????lName, phName, [Type], fGrpName, 
+????[Size], [MaxSize], 
+????fileId, CreateLSN, DropLSN, UniqueId, 
+????ReadOnlyLSN, 
+????ReadWriteLSN, 
+????BackupSizeInBytes, 
+????SourceBlockSize, 
+????FileGroupId, 
+????LogGroupGuid, 
+????DiffBaseLSN, 
+????DiffBaseGuid, 
+????IsReadOnly, 
+????IsPresent,
+????TDEThumbprint
+????)
+EXEC ( @cmd_restore )
+
+-- TODO check the recovery mode of the database, and determine if recovery needed in this step
+IF @RecoveryModel = 'SIMPLE'
+????SET @cmd_restore = 'RESTORE DATABASE ' + @dbname_new + '
+????FROM disk = ''' + @source_dir + @diskfile + ''' WITH RECOVERY '
+ELSE
+????SET @cmd_restore = 'RESTORE DATABASE ' + @dbname_new + '
+????FROM disk = ''' + @source_dir + @diskfile + ''' WITH NORECOVERY '
+
+DECLARE cur_dbfile CURSOR FOR
+????select lName, phName, [Type] from #tmp_dbfile 
+????
+declare @lName nvarchar(128), @phName nvarchar(260), @Type char(1)
+declare @db_filenr int, @log_filenr int, @ext char(4)
+SET @db_filenr = 0 
+SET @log_filenr = 0
+
+OPEN cur_dbfile 
+FETCH NEXT FROM cur_dbfile INTO @lName, @phName, @Type
+WHILE @@Fetch_Status = 0
+BEGIN
+????if @Type = 'D'
+????BEGIN
+????????SET @db_filenr = @db_filenr + 1 
+
+????????if @db_filenr = 1
+????????????set @ext = '.MDF'
+????????else
+????????????set @ext = '.NDF'
+
+????????---- Append ----
+????????SET @cmd_restore = @cmd_restore + ',
+????MOVE ''' + @lName + ''' TO ''' + @datafile_dir + @dbname_new + '_Data_' + CAST( @db_filenr as varchar(2)) + @ext + ''''
+????
+????----------------
+????END
+????else if @Type = 'L'
+????BEGIN
+????????SET @log_filenr = @log_filenr + 1
+????---- Append ----
+????????SET @cmd_restore = @cmd_restore + ',
+????MOVE ''' + @lName + ''' TO ''' + @logfile_dir + @dbname_new + '_Log_' + CAST( @log_filenr as varchar(2)) + '.LDF'''
+????----------------
+????END
+????else if @Type = 'F'
+????BEGIN
+????---- Append ----
+????????SET @cmd_restore = @cmd_restore + ',
+????MOVE ''' + @lName + ''' TO ''' + @new_FT_Dir + ''''
+????----------------
+????END
+
+????FETCH NEXT FROM cur_dbfile INTO @lName, @phName, @Type
+END
+
+CLOSE cur_dbfile
+DEALLOCATE cur_dbfile
+
+IF @InfoLevel != @SILENT 
+????SET @cmd_restore += ', STATS = 10' 
+
+-- SET NOCOUNT OFF
+
+PRINT @cmd_restore 
+
+IF @RunMode = @RESTORE
+BEGIN 
+????if @InfoLevel != @SILENT print 'Now restoring database from ' + @source_dir + @diskfile + '...'
+????EXEC ( @cmd_restore )
+END
+
+--- TODO restore differential backup
+
+/*****************************************************************************
+* Restore log backup
+*
+******************************************************************************/
+IF @RecoveryModel IS NULL OR @RecoveryModel != 'SIMPLE'
+BEGIN 
+
+SELECT TOP 1 @diskfile = DiskFileName, @LSN = LastLSN, @RecoveryModel = RecoveryModel, @BackupStartDate = BackupStartDate
+????from #tmp_header 
+????where backuptype = 2 and DataBaseName = @dbname
+ AND FirstLSN <= @LSN AND LastLSN >= @LSN AND BackupStartDate > @BackupStartDate
+????ORDER BY BackupStartDate ASC 
+
+WHILE @@RowCount = 1
+BEGIN
+????SET @cmd_restore = 'RESTORE LOG ' + @dbname_new + ' 
+????FROM disk = ''' + @source_dir + @diskfile + ''' WITH NORECOVERY' 
+
+????if @InfoLevel != @SILENT SET @cmd_restore += ', STATS=10'
+
+????IF @RunMode = @RESTORE BEGIN
+????????if @InfoLevel != @SILENT print 'Now restoring log from ' + @source_dir + @diskfile + '...'
+????????EXEC ( @cmd_restore )
+????End
+????Else BEGIN
+????????print @NEWLINE
+????????PRINT @cmd_restore
+????????print @NEWLINE????????
+????END
+
+????SELECT TOP 1 @diskfile = DiskFileName, @LSN = LastLSN, @RecoveryModel = RecoveryModel, @BackupStartDate = BackupStartDate
+????????from #tmp_header 
+????????where backuptype = 2 and DataBaseName = @dbname
+???????? AND FirstLSN <= @LSN AND LastLSN >= @LSN AND BackupStartDate > @BackupStartDate
+????????ORDER BY BackupStartDate ASC 
+END
+
+-- Recover the database
+SET @cmd_restore = 'RESTORE DATABASE ' + @dbname_new + ' WITH RECOVERY '
+if @RunMode = @RESTORE
+BEGIN
+????if @InfoLevel != @SILENT print 'Now recover database ...'
+????EXEC (@cmd_restore)
+END
+ELSE
+BEGIN
+????print @NEWLINE
+????PRINT @cmd_restore
+????print @NEWLINE
+END
+
+END
+
+drop table #tmp_diskfile 
+drop table #tmp_dbfile
+drop table #tmp_header
+
+IF @InfoLevel != @SILENT 
+????print '======================================= Finished ==============================================='

@@ -1,0 +1,28 @@
+Change all of your database owners
+
+Scenario: DBA1 left the company and never removed him/herself as the owner of databases all over the company. You are DBA2 and just got hired to replace DBA1. They plan to disable DBA1's account tomorrow.
+
+You can either walk through every database on every server or connect to each server, choose your desired new owner login (in this case I choose SA) and run this script to save the day.
+
+In later version of SQL Server you can run this against several instances at one time.
+
+
+
+EXEC sp_MSForEachDB 'EXEC sp_helpdb ?'
+----I'd save this output to a text file somewhere for safe keeping 
+
+
+EXEC sp_MSForEachDB 
+'Declare @name varchar(100)
+ select @name = ''?''
+ PRINT @name
+ IF db_id(@name) > 4
+ BEGIN
+ USE ?
+ EXEC dbo.sp_changedbowner @loginame = ''sa'', @map = false
+ END'
+
+
+
+
+

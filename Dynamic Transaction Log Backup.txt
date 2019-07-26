@@ -1,0 +1,152 @@
+Have you ever added a database to the server and forgot to add it to the backup plan? Now you don't have to worry about that task. This procedure uses the database names from sys.databases and backs each transaction log up to a local drive. Only a few things are required. 1) A local drive, 2) DB Mail, mail profile and recipient. (or comment out the mail section), and 3) the ability to execute xp_create_subdir. An SQL Agent job can call this procedure on a predefined schedule and you never miss a database backup again. mws
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------
+-- This procedure was written to facilitate the backing up of the transaction logs on this server
+-- Many times new databases are created and the backup procedures forgotten to be 
+-- modified to include the new databases. This procedure will back up the transaction logs
+-- to the specified root folder/instancename/database/logs with a name of
+-- DatabaseName_YYYY_MM_DD_HH_MM_SS.log 
+--
+-- This procedure requires DB Mail to be configured to receive error notifications.
+-- The profile i use is named SQL Backup Mail	
+--
+-- Author: Mitchell Spruill
+-- 6/22/2011
+-------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------
+CREATE PROCEDURE usp_BackupTransactionLogs
+AS
+BEGIN
+	-- construct a working table to hold all the databases from sys.databases
+	DECLARE @DBTable as 
+	TABLE
+	(
+		RowId int Identity(1,1),
+		DatabaseName varchar(150)
+	)
+
+	set nocount on
+						
+	DECLARE @BackupRoot varchar(100)
+	DECLARE @DatabaseName as varchar(100)
+	DECLARE @RowId as int
+	DECLARE @RowCount as int
+	DECLARE @BackupPath varchar(500)
+	DECLARE @DateTime varchar(25)
+	DECLARE @InstanceName varchar(50)
+	DECLARE @DataPath varchar(100)
+	DECLARE @ProductVersion int
+	DECLARE @EngineEdition int
+	DECLARE @SQL as nvarchar(500)
+	DECLARE @R2 as bit
+	DECLARE @Body as nvarchar(max)
+	DECLARE @BackupType as nvarchar(5)
+	DECLARE @Start as datetime
+	DECLARE @End as int
+	DECLARE @Recipients as varchar(1000)
+	DECLARE @Profile_name as varchar(1000)
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	----- Must be set based on individual needs
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	SET @BackupRoot = N'Q:'  -- everything is below this point.
+	SET @Recipients = 'sqldba@somecompany.com'
+	SET @Profile_name = 'SQL Backup Mail'
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	----------------------------------------------------------------------------------------------------------------------------------------------------
+	
+	SET @R2 = CASE  WHEN CHARINDEX(' R2 ', @@VERSION) > 0 then 1 else 0 end
+	SET @EngineEdition = CAST(SERVERPROPERTY('EngineEdition')  as int)
+	SET @ProductVersion = CAST( LEFT(CAST(SERVERPROPERTY('ProductVersion') as varchar),
+					CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') as varchar)) -1) as int)
+	SET @DateTime=replace(replace(replace(convert(varchar(25), getdate(), 120),'-','_'),':','_'),' ','_')
+	SET @RowCount = (select COUNT(*) from @DBTable)
+	SET @InstanceName = ISNULL(CAST(SERVERPROPERTY('INSTANCENAME') as varchar),'Default')
+	SET @BackupType = 'Logs'
+	
+	-- Insert into the working table all the databases on this server
+	-- excluding databases like model, tempdb
+	insert into @DBTable(DatabaseName) 
+	SELECT  name FROM    sys.databases 
+	WHERE state = 0 -- online
+	AND recovery_model IN (1, 2) -- full/bulk mode
+	AND name NOT IN (N'model', N'tempdb') -- exclude these databases
+	ORDER BY name -- by putting them in order we can track the backup progress on the file system.
+	
+	
+	-- select the top database in the table and start the backup
+	SELECT top 1 @RowId=RowId,@DatabaseName=DatabaseName from @DBTable
+	WHILE (@RowCount > 0)
+	BEGIN
+
+		-- data path = root + instancename + databasename
+		SET @DataPath=@BackupRoot + '\' + @InstanceName + '\' + @DatabaseName + '\' + @BackupType
+		
+		-- backup path = datapath + databasename + time stamp
+		SET @BackupPath = @DataPath + '\' + @DatabaseName   + '_' +  @DateTime +'.Log' 
+
+		-- if directory does not exist the create it		
+		EXEC master.dbo.xp_create_subdir @DataPath
+
+		-- build sql statement
+		SET @SQL = 'BACKUP LOG [' + @DatabaseName + '] TO DISK = ''' + @BackupPath + ''' WITH INIT'
+								 
+		-- if SQL Server 2005 use this
+		IF (@ProductVersion >= 9 AND (@EngineEdition = 3 or @R2 = 1))
+		begin
+			SET @SQL = @SQL + ', FORMAT, CHECKSUM, STOP_ON_ERROR'
+		end
+					
+		-- if SQL Server 2008 Enterprise edition or 2008 R2  and not encrypted then use compression 
+			IF (
+					@ProductVersion >= 10 AND 
+					(@EngineEdition = 3 or @R2 = 1) AND
+					NOT EXISTS  (Select 1 from sys.databases where name = @DatabaseName and is_encrypted = 1)
+				)
+			begin
+				SET @SQL = @SQL + ', COMPRESSION'
+			end
+		
+			-- execute the sql statement
+		BEGIN TRY
+			EXECUTE sp_executeSQL @SQL
+		END TRY
+		BEGIN CATCH
+				SET @Body = '[Error Message]' + char(13) + char(10) + ERROR_MESSAGE()
+				+ char(13) + char(10) + char(13) + char(10) 
+				+ '[Database]' + char(13) + char(10) + @DatabaseName
+				+ char(13) + char(10) + char(13) + char(10) 
+				+ '[Backup Drive]'	+ char(13) + char(10)  + @BackupRoot
+				+ char(13) + char(10) + char(13) + char(10) 
+				+ '[Instance Name]' + char(13) + char(10) + @InstanceName
+				+ char(13) + char(10) + char(13) + char(10) 
+				+ '[SQL Statement]'  + char(13) + char(10) + @SQL
+				
+				EXEC msdb.dbo.sp_send_dbmail  
+						@importance='HIGH',
+						@profile_name=@Profile_name,
+						@recipients=@Recipients,
+						@subject=N'Database backup error',
+						@body=@Body
+		END CATCH
+		
+		-- remove from working table
+		delete from @DBTable where RowId=@RowId
+
+		-- get next database to backup
+		SELECT top 1 @RowId=RowId,@DatabaseName=DatabaseName from @DBTable
+
+		-- decrement counter
+		Set @RowCount = @RowCount - 1
+	END
+
+	set nocount off
+END
+
+
+

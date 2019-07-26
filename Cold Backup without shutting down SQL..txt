@@ -1,0 +1,24 @@
+Cold Backup without shutting down SQL.
+
+Set the Autoclose database option to True and perform a cold backup of your data files without even shutting down the SQL Server Services.
+
+
+
+
+use master
+
+go
+ 
+
+sp_dboption 'database_name','autoclose',true
+or
+sp_dboption 'database_name','offline',true
+
+copy the datafiles to your backup folder....
+
+sp_dboption 'database_name','autoclose',false
+or
+sp_dboption 'database_name','offline',false
+
+
+

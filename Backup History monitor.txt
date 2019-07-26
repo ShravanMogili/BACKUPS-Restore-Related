@@ -1,0 +1,19 @@
+select 
+msdb..backupset.machine_name, 
+msdb..backupset.server_name, 
+msdb..backupset.database_name, 
+databasepropertyex (msdb..backupset.database_name, 'Recovery') as mode, 
+msdb..backupset.type, 
+msdb..backupset.user_name,  
+msdb..backupset.description, 
+msdb..backupset.media_set_id, 
+msdb..backupset.name, 
+msdb..backupmediafamily.physical_device_name, 
+msdb..backupset.backup_size, 
+msdb..backupset.backup_start_date, 
+msdb..backupset.backup_finish_date 
+from msdb..backupset 
+join msdb..backupmediafamily 
+on msdb..backupmediafamily.media_set_id = msdb..backupset.media_set_id 
+where msdb..backupset.backup_start_date > getdate () - 1 
+order by msdb..backupset.database_name, msdb..backupset.media_set_id

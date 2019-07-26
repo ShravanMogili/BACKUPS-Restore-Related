@@ -1,0 +1,161 @@
+--Query SQL Server backup history and restore history records
+--http://blogs.msdn.com/b/bradchen/archive/2014/03/13/sql-server-backup-history-and-restore-history.aspx
+
+
+SELECT 
+ bs.backup_set_id,
+ bs.database_name,
+ bs.backup_start_date,
+ bs.backup_finish_date,
+ CAST(CAST(bs.backup_size/1000000 AS INT) AS VARCHAR(14)) + ' ' + 'MB' AS [Size],
+ CAST(DATEDIFF(second, bs.backup_start_date,
+ bs.backup_finish_date) AS VARCHAR(4)) + ' ' + 'Seconds' [TimeTaken],
+ CASE bs.[type]
+ WHEN 'D' THEN 'Full Backup'
+ WHEN 'I' THEN 'Differential Backup'
+ WHEN 'L' THEN 'TLog Backup'
+ WHEN 'F' THEN 'File or filegroup'
+ WHEN 'G' THEN 'Differential file'
+ WHEN 'P' THEN 'Partial'
+ WHEN 'Q' THEN 'Differential Partial'
+ END AS BackupType,
+ bmf.physical_device_name,
+ CAST(bs.first_lsn AS VARCHAR(50)) AS first_lsn,
+ CAST(bs.last_lsn AS VARCHAR(50)) AS last_lsn,
+ bs.server_name,
+ bs.recovery_model
+ From msdb.dbo.backupset bs
+ INNER JOIN msdb.dbo.backupmediafamily bmf 
+ ON bs.media_set_id = bmf.media_set_id
+ where bs.database_name like '%DB_Name%' --put here the required db name 
+ ORDER BY bs.server_name,bs.database_name,bs.backup_start_date desc;
+ GO
+
+
+--http://timradney.com/2014/02/17/how-to-check-for-last-sql-server-backup/
+
+SELECT
+  DISTINCT
+        a.Name AS DatabaseName ,
+        CONVERT(SYSNAME, DATABASEPROPERTYEX(a.name, 'Recovery')) RecoveryModel ,
+        COALESCE(( SELECT   CONVERT(VARCHAR(12), MAX(backup_finish_date), 101)
+                   FROM     msdb.dbo.backupset
+                   WHERE    database_name = a.name
+                            AND type = 'd'
+                            AND is_copy_only = '0'
+                 ), 'No Full') AS 'Full' ,
+        COALESCE(( SELECT   CONVERT(VARCHAR(12), MAX(backup_finish_date), 101)
+                   FROM     msdb.dbo.backupset
+                   WHERE    database_name = a.name
+                            AND type = 'i'
+                            AND is_copy_only = '0'
+                 ), 'No Diff') AS 'Diff' ,
+        COALESCE(( SELECT   CONVERT(VARCHAR(20), MAX(backup_finish_date), 120)
+                   FROM     msdb.dbo.backupset
+                   WHERE    database_name = a.name
+                            AND type = 'l'
+                 ), 'No Log') AS 'LastLog' ,
+        COALESCE(( SELECT   CONVERT(VARCHAR(20), backup_finish_date, 120)
+                   FROM     ( SELECT    ROW_NUMBER() OVER ( ORDER BY backup_finish_date DESC ) AS 'rownum' ,
+                                        backup_finish_date
+                              FROM      msdb.dbo.backupset
+                              WHERE     database_name = a.name
+                                        AND type = 'l'
+                            ) withrownum
+                   WHERE    rownum = 2
+                 ), 'No Log') AS 'LastLog2'
+FROM    sys.databases a
+        LEFT OUTER JOIN msdb.dbo.backupset b ON b.database_name = a.name
+WHERE   a.name <> 'tempdb'
+        AND a.state_desc = 'online'
+GROUP BY a.Name ,
+        a.compatibility_level
+ORDER BY a.name
+
+
+
+
+--https://mssqltalks.wordpress.com/2013/02/26/how-to-get-sql-server-database-backup-history-or-when-was-my-sql-server-database-last-backed-up/
+
+It’s important to keep track of all the backups happening to make sure we have a latest backup available and all the required databases are backed up regularly. Use below scripts to check backup history and other backup related details.
+
+1: Script to get backup history of all the databases. With a little modification as indicated in script you can easily get below details:
+
+    Script for Backup History of only one database.
+    Script for Backup history of one/ all the databases between particular dates
+    Script for only Full/Diff/Log backups of all/ Particular database, complete history or between particular dates.
+
+SELECT p.database_name AS DatabaseName,
+p.backup_start_date AS 'Backup Start Time',
+p.backup_finish_date AS 'Backup Finish Time',
+CAST((DATEDIFF(MINUTE, p.backup_start_date, p.backup_finish_date)) AS varchar)+ ' min  '+ CAST((DATEDIFF(ss, p.backup_start_date, p.backup_finish_date)) AS varchar) + ' sec ' AS [Total Time] ,
+CASE p.type
+WHEN 'D' THEN 'Full '
+WHEN 'I' THEN 'Diffrential'
+WHEN 'L' THEN 'Log'
+END AS 'Backup Type',
+Cast(p.backup_size/1024/1024 AS numeric(10,2)) AS 'Backup Size(MB)' ,
+a.physical_device_name AS 'Physical File location'
+FROM msdb..backupmediafamily a,
+msdb..backupset p
+WHERE a.media_set_id=p.media_set_id
+ 
+-- Uncomment below line and Replace <Database name> with DB you want to check backup history
+--and p.database_name='Database name'
+ 
+-- Uncomment below line and replace start and end dates with dates you want to check history
+--and p.backup_start_date>'2013-01-20' and p.backup_start_date<'2013-01-25 23:59:59'
+ 
+--Uncomment below line to see only the full backups, replace with 'I' to check diffrential and 'L' to check only Log backups.
+--and p.type='D'
+ 
+ORDER BY p.backup_start_date DESC
+
+--2: Script to get name of databases are never backed up:
+********************************************************
+
+SELECT name AS 'Database Name',
+       NULL AS [last backup]
+FROM sys.sysdatabases
+WHERE name NOT IN
+    (SELECT database_name
+     FROM msdb..backupset)
+  AND name <> 'tempdb'
+
+
+--3: Latest Full/Differential/Log backup of one/all databases with duration:
+****************************************************************************
+
+SELECT Database_name,
+       MAX(Backup_finish_date) AS 'latest Backup Date',
+       CAST((DATEDIFF(hh, MAX(Backup_finish_date), GETDATE())) AS varchar) AS [Total Time]
+FROM msdb..backupset
+ 
+--Replace 'D' with 'I' to check latet Diff backup and 'L' to check latest full backup
+WHERE TYPE='D'
+ 
+--Uncomment below line and replace database name you want to check latest full backup
+--and Database_name='master'
+ 
+GROUP BY database_name
+
+
+Important Points:
+
+These scripts can esaily be used in a scheduled job and scheduled to run so that you always know which databases are missing from backup schedules and if all of them are backed up properly.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

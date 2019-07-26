@@ -1,0 +1,48 @@
+
+    Step 1: Delete data from subsystem table on MSDB
+
+Installation path is different source server to target server, so configure the new path on target server. Otherwise all sql jobs will be failed. So delete the old path and fill current path on syssubsystems table. Execute the following two steps.
+Delete data from subsystem table
+1. Delete from msdb.dbo.syssubsystems
+Fill the table with new rows pointing to the proper location of the DLLs
+2. EXEC msdb.dbo.sp_verify_subsystems 1
+After run the above procedure pointing to the new path, Then Start SQL Agent, and run a test job
+
+    Step 2: Enable service broker
+
+Service broker essential for database mail, If you do not enable service broker mail will queue E-mail message, but will not able to deliver the message. 
+
+Service broker must be enabled.
+
+Use the following code to enable the Service Broker
+Use master
+Alter database databasename set enable_broker; 
+
+
+
+
+
+Step 1: Delete data from subsystem table on MSDB 
+
+       Delete from msdb.dbo.syssubsystems
+       go
+       EXEC msdb.dbo.sp_verify_subsystems 1
+
+Step 2: Enable service broker
+
+     Alter database msdb set enable_broker;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

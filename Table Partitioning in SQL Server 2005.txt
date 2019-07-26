@@ -1,0 +1,72 @@
+Table Partitioning in SQL Server 2005
+
+--Creatinmg Partition Function
+CREATE PARTITION FUNCTION PartiFunc( INT )
+AS RANGE LEFT FOR VALUES
+(	1, 10, 100, 1000, 10000, 100000, 1000000 )
+
+--Creatinmg Partition Scheme
+CREATE PARTITION SCHEME PartiSche
+AS PARTITION PartiFunc ALL TO (	[PRIMARY] )
+
+--Creatinmg Partition Table
+CREATE TABLE dbo.PartitionTable
+(	RowID	INT		IDENTITY(1, 1),
+	Number	INT
+)ON PartiSche ( RowID )
+
+INSERT	dbo.PartitionTable
+(		Number )
+SELECT	ROW_NUMBER() OVER( ORDER BY [name] ) AS RID
+FROM	sys.all_objects
+
+--View of partiton Recrds 
+SELECT	CONVERT( VARCHAR(16), PS.[name] )AS Partition_Scheme, P.partition_number,
+		CONVERT( VARCHAR(10), DS2.[name])AS PartionFileGroup,
+		CONVERT( VARCHAR(19), COALESCE( V.[Value], '' )) AS Range_Boundry,
+		STR( P.Rows, 9 ) AS Rows
+FROM	sys.Indexes I
+		INNER JOIN	sys.partition_schemes		PS	ON	I.data_space_id		= PS.data_space_id
+		INNER JOIN	sys.destination_data_spaces DDS	ON	PS.data_space_id	= DDS.partition_scheme_id
+		INNER JOIN	sys.data_spaces				DS2	ON	DDS.data_space_id	= DS2.data_space_id
+		INNER JOIN	sys.partitions				P	ON	DDS.destination_id	= P.partition_number AND
+														P.[Object_id]		= I.[Object_ID] AND
+														P.index_id			= I.index_id
+		INNER JOIN	sys.partition_functions		PF	ON	PS.function_id		= PF.function_id
+		LEFT  JOIN	sys.partition_range_values	V	ON	PF.function_id		= V.function_id AND
+														V.boundary_id		= P.partition_number - pf.boundary_value_on_right
+WHERE	i.[object_id]	= OBJECT_ID( 'PartitionTable' ) AND
+		i.index_id		= 0
+ORDER BY P.partition_number
+
+CREATE PARTITION FUNCTION myPartFn ( NUMERIC (18,2) ) AS RANGE LEFT FOR VALUES( 5000, 10000, 15000, 20000, 25000 )
+/* <=5000, >5000 AND <=10000, >10000 AND <=15000, >15000 AND <=20000, >20000 AND <=25000, >25000 */
+
+--CREATE PARTITION FUNCTION myPartFn ( NUMERIC (18,2) ) AS RANGE RIGHT FOR VALUES( 5000, 10000, 15000, 20000, 25000 )
+/* <5000, >=5000 AND <10000, >=10000 AND <15000, >=15000 AND <20000, >=20000 AND <25000, >=25000 */
+
+CREATE PARTITION SCHEME myPartSchm AS PARTITION myPartFn ALL TO ([PRIMARY])
+
+SELECT * FROM sys.partition_functions; SELECT * FROM sys.partition_schemes;
+
+CREATE TABLE dbo.myPartitionTable
+( EmployeeID	INT	IDENTITY(1,1), SalaryAmt	NUMERIC(18, 2) ) ON myPartSchm( SalaryAmt )
+
+CREATE CLUSTERED INDEX C_INDX_myPartitionTable_00001 ON dbo.myPartitionTable( EmployeeID ) 
+CREATE NONCLUSTERED INDEX NC_INDX_myPartitionTable_00001 ON dbo.myPartitionTable( SalaryAmt ) 
+
+SELECT * FROM sys.partitions WHERE [object_id] = OBJECT_ID(N'dbo.myPartitionTable')
+
+INSERT INTO dbo.myPartitionTable( SalaryAmt )
+SELECT 2000 UNION ALL SELECT 2500 UNION ALL SELECT 3000 UNION ALL SELECT 3500 UNION ALL SELECT 5000 UNION ALL 
+SELECT 6000 UNION ALL SELECT 7300 UNION ALL SELECT 7500 UNION ALL SELECT 9800 UNION ALL SELECT 8900 UNION ALL 
+SELECT 11000 UNION ALL SELECT 7890 UNION ALL SELECT 15200 UNION ALL SELECT 17500 UNION ALL SELECT 2500 UNION ALL 
+SELECT 25000 UNION ALL SELECT 78000 UNION ALL SELECT 65000 UNION ALL SELECT 22000 UNION ALL SELECT 20000
+
+SELECT * FROM dbo.myPartitionTable WHERE SalaryAmt <= 5000
+
+SELECT * FROM sys.partitions WHERE [object_id] = OBJECT_ID(N'dbo.myPartitionTable')
+
+DROP TABLE dbo.myPartitionTable
+DROP PARTITION SCHEME myPartSchm 
+DROP PARTITION FUNCTION myPartFn 

@@ -1,0 +1,46 @@
+Check SQL DB backups details remotely by PowerShell
+http://www.sqlservercentral.com/scripts/SQL+Powershell/128916/
+
+ Create a .txt and write down all your SQL Instance name like below..
+SQLInstanceName1
+SQLInstanceName2
+SQLInstanceName3
+Save the txt file in safe location. C:\ServerList.txt
+
+Run the following PowerShell script and see the results, Last Backup details of any type of backups ..
+
+Steps to run the powershell script..
+1) Save the script in folder "D:\CheckSQLBackups.ps1"
+2) Start windows powershell with the run as administrator option 
+3) Run the below command on windows powershell prompt like below. 
+     
+
+PS C:\> D:\CheckSQLBackups.ps1
+
+
+
+
+
+FOREACH($svr in GC C:\ServerList.txt)
+{
+Write-host "----------------------------------------------------------------------------------------------------------------"
+Write-Host $svr
+Write-host "----------------------------------------------------------------------------------------------------------------"
+INVOKE-SQLCMD "select name,create_date,state_desc,recovery_model_desc ,Bkp.BackupSize,Bkp.backup_finish_date,TYPE,physical_device_name
+from sys.databases DBs
+LEFT OUTER JOIN
+(
+	select  
+	database_name,
+	CAST(cast(((backup_size/1024)/1024)/1024 as decimal(18,4)) AS VARCHAR) + ' GB' AS BackupSize,
+	backup_finish_date,
+	case when type='D' THEN 'FULL' when type='I' THEN 'DIFFERENTIAL' when type='L' THEN 'TRANSACTION' END AS TYPE, 
+	physical_device_name 
+	from msdb..backupmediafamily a ,msdb..backupset b  
+	where a.media_set_id=b.media_set_id AND backup_set_id IN (SELECT MAX(backup_set_id) from msdb..backupset group by database_name,type) 
+
+) Bkp 
+on DBs.name=Bkp.database_name
+where name not in ('tempdb')
+order by name,Bkp.backup_finish_date
+" -ServerInstance $svr -querytimeout 65534 | FT -AUTOSIZE | Out-String -Width 4096
